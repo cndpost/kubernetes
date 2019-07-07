@@ -1,22 +1,27 @@
-package(default_visibility = ["//visibility:public"])
-
-licenses(["notice"])
-
-load(
-    "@io_bazel_rules_go//go:def.bzl",
-    "go_library",
-)
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "go_default_library",
     srcs = [
+        "args.go",
         "bash_completions.go",
         "cobra.go",
         "command.go",
         "command_notwin.go",
+        "command_win.go",
+        "zsh_completions.go",
     ],
-    tags = ["automanaged"],
-    deps = ["//vendor/github.com/spf13/pflag:go_default_library"],
+    importmap = "k8s.io/kubernetes/vendor/github.com/spf13/cobra",
+    importpath = "github.com/spf13/cobra",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//vendor/github.com/spf13/pflag:go_default_library",
+    ] + select({
+        "@io_bazel_rules_go//go/platform:windows": [
+            "//vendor/github.com/inconshreveable/mousetrap:go_default_library",
+        ],
+        "//conditions:default": [],
+    }),
 )
 
 filegroup(
@@ -33,4 +38,5 @@ filegroup(
         "//vendor/github.com/spf13/cobra/doc:all-srcs",
     ],
     tags = ["automanaged"],
+    visibility = ["//visibility:public"],
 )

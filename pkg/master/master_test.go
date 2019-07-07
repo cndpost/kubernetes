@@ -17,6 +17,7 @@ limitations under the License.
 package master
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"io/ioutil"
@@ -24,116 +25,182 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 
+	certificatesapiv1beta1 "k8s.io/api/certificates/v1beta1"
+	apiv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/version"
-	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
+	"k8s.io/apiserver/pkg/authorization/authorizerfactory"
 	genericapiserver "k8s.io/apiserver/pkg/server"
 	"k8s.io/apiserver/pkg/server/options"
+	"k8s.io/apiserver/pkg/server/resourceconfig"
 	serverstorage "k8s.io/apiserver/pkg/server/storage"
-	etcdtesting "k8s.io/apiserver/pkg/storage/etcd/testing"
+	etcd3testing "k8s.io/apiserver/pkg/storage/etcd3/testing"
+	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/fake"
 	restclient "k8s.io/client-go/rest"
-	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	"k8s.io/kubernetes/pkg/api/testapi"
-	apiv1 "k8s.io/kubernetes/pkg/api/v1"
-	"k8s.io/kubernetes/pkg/apis/apps"
-	appsapiv1beta1 "k8s.io/kubernetes/pkg/apis/apps/v1beta1"
-	"k8s.io/kubernetes/pkg/apis/autoscaling"
-	autoscalingapiv1 "k8s.io/kubernetes/pkg/apis/autoscaling/v1"
 	"k8s.io/kubernetes/pkg/apis/batch"
-	batchapiv1 "k8s.io/kubernetes/pkg/apis/batch/v1"
-	batchapiv2alpha1 "k8s.io/kubernetes/pkg/apis/batch/v2alpha1"
-	"k8s.io/kubernetes/pkg/apis/certificates"
-	"k8s.io/kubernetes/pkg/apis/extensions"
-	extensionsapiv1beta1 "k8s.io/kubernetes/pkg/apis/extensions/v1beta1"
-	"k8s.io/kubernetes/pkg/apis/rbac"
-	"k8s.io/kubernetes/pkg/client/clientset_generated/clientset/fake"
+	"k8s.io/kubernetes/pkg/apis/networking"
+	apisstorage "k8s.io/kubernetes/pkg/apis/storage"
 	kubeletclient "k8s.io/kubernetes/pkg/kubelet/client"
+	"k8s.io/kubernetes/pkg/master/reconcilers"
+	"k8s.io/kubernetes/pkg/master/storageversionhashdata"
+	certificatesrest "k8s.io/kubernetes/pkg/registry/certificates/rest"
+	corerest "k8s.io/kubernetes/pkg/registry/core/rest"
+	"k8s.io/kubernetes/pkg/registry/registrytest"
 	kubeversion "k8s.io/kubernetes/pkg/version"
 
 	"github.com/stretchr/testify/assert"
 )
 
 // setUp is a convience function for setting up for (most) tests.
-func setUp(t *testing.T) (*etcdtesting.EtcdTestServer, Config, *assert.Assertions) {
-	server, storageConfig := etcdtesting.NewUnsecuredEtcd3TestClientServer(t, api.Scheme)
+func setUp(t *testing.T) (*etcd3testing.EtcdTestServer, Config, *assert.Assertions) {
+	server, storageConfig := etcd3testing.NewUnsecuredEtcd3TestClientServer(t)
 
 	config := &Config{
-		GenericConfig:           genericapiserver.NewConfig(api.Codecs),
-		APIResourceConfigSource: DefaultAPIResourceConfigSource(),
-		APIServerServicePort:    443,
-		MasterCount:             1,
+		GenericConfig: genericapiserver.NewConfig(legacyscheme.Codecs),
+		ExtraConfig: ExtraConfig{
+			APIResourceConfigSource: DefaultAPIResourceConfigSource(),
+			APIServerServicePort:    443,
+			MasterCount:             1,
+			EndpointReconcilerType:  reconcilers.MasterCountReconcilerType,
+		},
 	}
 
-	resourceEncoding := serverstorage.NewDefaultResourceEncodingConfig(api.Registry)
-	resourceEncoding.SetVersionEncoding(api.GroupName, api.Registry.GroupOrDie(api.GroupName).GroupVersion, schema.GroupVersion{Group: api.GroupName, Version: runtime.APIVersionInternal})
-	resourceEncoding.SetVersionEncoding(autoscaling.GroupName, *testapi.Autoscaling.GroupVersion(), schema.GroupVersion{Group: autoscaling.GroupName, Version: runtime.APIVersionInternal})
-	resourceEncoding.SetVersionEncoding(batch.GroupName, *testapi.Batch.GroupVersion(), schema.GroupVersion{Group: batch.GroupName, Version: runtime.APIVersionInternal})
-	resourceEncoding.SetVersionEncoding(apps.GroupName, *testapi.Apps.GroupVersion(), schema.GroupVersion{Group: apps.GroupName, Version: runtime.APIVersionInternal})
-	resourceEncoding.SetVersionEncoding(extensions.GroupName, *testapi.Extensions.GroupVersion(), schema.GroupVersion{Group: extensions.GroupName, Version: runtime.APIVersionInternal})
-	resourceEncoding.SetVersionEncoding(rbac.GroupName, *testapi.Rbac.GroupVersion(), schema.GroupVersion{Group: rbac.GroupName, Version: runtime.APIVersionInternal})
-	resourceEncoding.SetVersionEncoding(certificates.GroupName, *testapi.Certificates.GroupVersion(), schema.GroupVersion{Group: certificates.GroupName, Version: runtime.APIVersionInternal})
-	storageFactory := serverstorage.NewDefaultStorageFactory(*storageConfig, testapi.StorageMediaType(), api.Codecs, resourceEncoding, DefaultAPIResourceConfigSource())
+	resourceEncoding := serverstorage.NewDefaultResourceEncodingConfig(legacyscheme.Scheme)
+	// This configures the testing master the same way the real master is
+	// configured. The storage versions of these resources are different
+	// from the storage versions of other resources in their group.
+	resourceEncodingOverrides := []schema.GroupVersionResource{
+		batch.Resource("cronjobs").WithVersion("v1beta1"),
+		apisstorage.Resource("volumeattachments").WithVersion("v1beta1"),
+		networking.Resource("ingresses").WithVersion("v1beta1"),
+	}
+	resourceEncoding = resourceconfig.MergeResourceEncodingConfigs(resourceEncoding, resourceEncodingOverrides)
+	storageFactory := serverstorage.NewDefaultStorageFactory(*storageConfig, testapi.StorageMediaType(), legacyscheme.Codecs, resourceEncoding, DefaultAPIResourceConfigSource(), nil)
 
-	err := options.NewEtcdOptions(storageConfig).ApplyWithStorageFactoryTo(storageFactory, config.GenericConfig)
+	etcdOptions := options.NewEtcdOptions(storageConfig)
+	// unit tests don't need watch cache and it leaks lots of goroutines with etcd testing functions during unit tests
+	etcdOptions.EnableWatchCache = false
+	err := etcdOptions.ApplyWithStorageFactoryTo(storageFactory, config.GenericConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	kubeVersion := kubeversion.Get()
+	config.GenericConfig.Authorization.Authorizer = authorizerfactory.NewAlwaysAllowAuthorizer()
 	config.GenericConfig.Version = &kubeVersion
-	config.StorageFactory = storageFactory
-	config.GenericConfig.LoopbackClientConfig = &restclient.Config{APIPath: "/api", ContentConfig: restclient.ContentConfig{NegotiatedSerializer: api.Codecs}}
+	config.ExtraConfig.StorageFactory = storageFactory
+	config.GenericConfig.LoopbackClientConfig = &restclient.Config{APIPath: "/api", ContentConfig: restclient.ContentConfig{NegotiatedSerializer: legacyscheme.Codecs}}
 	config.GenericConfig.PublicAddress = net.ParseIP("192.168.10.4")
 	config.GenericConfig.LegacyAPIGroupPrefixes = sets.NewString("/api")
-	config.GenericConfig.RequestContextMapper = genericapirequest.NewRequestContextMapper()
-	config.GenericConfig.LoopbackClientConfig = &restclient.Config{APIPath: "/api", ContentConfig: restclient.ContentConfig{NegotiatedSerializer: api.Codecs}}
-	config.GenericConfig.EnableMetrics = true
-	config.EnableCoreControllers = false
-	config.KubeletClientConfig = kubeletclient.KubeletClientConfig{Port: 10250}
-	config.ProxyTransport = utilnet.SetTransportDefaults(&http.Transport{
-		Dial:            func(network, addr string) (net.Conn, error) { return nil, nil },
+	config.ExtraConfig.KubeletClientConfig = kubeletclient.KubeletClientConfig{Port: 10250}
+	config.ExtraConfig.ProxyTransport = utilnet.SetTransportDefaults(&http.Transport{
+		DialContext:     func(ctx context.Context, network, addr string) (net.Conn, error) { return nil, nil },
 		TLSClientConfig: &tls.Config{},
 	})
+
+	// set fake SecureServingInfo because the listener port is needed for the kubernetes service
+	config.GenericConfig.SecureServing = &genericapiserver.SecureServingInfo{Listener: fakeLocalhost443Listener{}}
+
+	clientset, err := kubernetes.NewForConfig(config.GenericConfig.LoopbackClientConfig)
+	if err != nil {
+		t.Fatalf("unable to create client set due to %v", err)
+	}
+	config.ExtraConfig.VersionedInformers = informers.NewSharedInformerFactory(clientset, config.GenericConfig.LoopbackClientConfig.Timeout)
 
 	return server, *config, assert.New(t)
 }
 
-func newMaster(t *testing.T) (*Master, *etcdtesting.EtcdTestServer, Config, *assert.Assertions) {
-	etcdserver, config, assert := setUp(t)
+type fakeLocalhost443Listener struct{}
 
-	master, err := config.Complete().New()
-	if err != nil {
-		t.Fatalf("Error in bringing up the master: %v", err)
+func (fakeLocalhost443Listener) Accept() (net.Conn, error) {
+	return nil, nil
+}
+
+func (fakeLocalhost443Listener) Close() error {
+	return nil
+}
+
+func (fakeLocalhost443Listener) Addr() net.Addr {
+	return &net.TCPAddr{
+		IP:   net.IPv4(127, 0, 0, 1),
+		Port: 443,
+	}
+}
+
+// TestLegacyRestStorageStrategies ensures that all Storage objects which are using the generic registry Store have
+// their various strategies properly wired up. This surfaced as a bug where strategies defined Export functions, but
+// they were never used outside of unit tests because the export strategies were not assigned inside the Store.
+func TestLegacyRestStorageStrategies(t *testing.T) {
+	_, etcdserver, masterCfg, _ := newMaster(t)
+	defer etcdserver.Terminate(t)
+
+	storageProvider := corerest.LegacyRESTStorageProvider{
+		StorageFactory:       masterCfg.ExtraConfig.StorageFactory,
+		ProxyTransport:       masterCfg.ExtraConfig.ProxyTransport,
+		KubeletClientConfig:  masterCfg.ExtraConfig.KubeletClientConfig,
+		EventTTL:             masterCfg.ExtraConfig.EventTTL,
+		ServiceIPRange:       masterCfg.ExtraConfig.ServiceIPRange,
+		ServiceNodePortRange: masterCfg.ExtraConfig.ServiceNodePortRange,
+		LoopbackClientConfig: masterCfg.GenericConfig.LoopbackClientConfig,
 	}
 
-	return master, etcdserver, config, assert
+	_, apiGroupInfo, err := storageProvider.NewLegacyRESTStorage(masterCfg.GenericConfig.RESTOptionsGetter)
+	if err != nil {
+		t.Errorf("failed to create legacy REST storage: %v", err)
+	}
+
+	// Any new stores with export logic will need to be added here:
+	exceptions := registrytest.StrategyExceptions{
+		// Only these stores should have an export strategy defined:
+		HasExportStrategy: []string{
+			"secrets",
+			"limitRanges",
+			"nodes",
+			"podTemplates",
+		},
+	}
+
+	strategyErrors := registrytest.ValidateStorageStrategies(apiGroupInfo.VersionedResourcesStorageMap["v1"], exceptions)
+	for _, err := range strategyErrors {
+		t.Error(err)
+	}
 }
 
-// limitedAPIResourceConfigSource only enables the core group, the extensions group, the batch group, and the autoscaling group.
-func limitedAPIResourceConfigSource() *serverstorage.ResourceConfig {
-	ret := serverstorage.NewResourceConfig()
-	ret.EnableVersions(
-		apiv1.SchemeGroupVersion,
-		extensionsapiv1beta1.SchemeGroupVersion,
-		batchapiv1.SchemeGroupVersion,
-		batchapiv2alpha1.SchemeGroupVersion,
-		appsapiv1beta1.SchemeGroupVersion,
-		autoscalingapiv1.SchemeGroupVersion,
-	)
-	return ret
+func TestCertificatesRestStorageStrategies(t *testing.T) {
+	_, etcdserver, masterCfg, _ := newMaster(t)
+	defer etcdserver.Terminate(t)
+
+	certStorageProvider := certificatesrest.RESTStorageProvider{}
+	apiGroupInfo, _ := certStorageProvider.NewRESTStorage(masterCfg.ExtraConfig.APIResourceConfigSource, masterCfg.GenericConfig.RESTOptionsGetter)
+
+	exceptions := registrytest.StrategyExceptions{
+		HasExportStrategy: []string{
+			"certificatesigningrequests",
+		},
+	}
+
+	strategyErrors := registrytest.ValidateStorageStrategies(
+		apiGroupInfo.VersionedResourcesStorageMap[certificatesapiv1beta1.SchemeGroupVersion.Version], exceptions)
+	for _, err := range strategyErrors {
+		t.Error(err)
+	}
 }
 
-// newLimitedMaster only enables the core group, the extensions group, the batch group, and the autoscaling group.
-func newLimitedMaster(t *testing.T) (*Master, *etcdtesting.EtcdTestServer, Config, *assert.Assertions) {
+func newMaster(t *testing.T) (*Master, *etcd3testing.EtcdTestServer, Config, *assert.Assertions) {
 	etcdserver, config, assert := setUp(t)
-	config.APIResourceConfigSource = limitedAPIResourceConfigSource()
-	master, err := config.Complete().New()
+
+	master, err := config.Complete().New(genericapiserver.NewEmptyDelegate())
 	if err != nil {
 		t.Fatalf("Error in bringing up the master: %v", err)
 	}
@@ -164,12 +231,6 @@ func TestVersion(t *testing.T) {
 	}
 }
 
-type fakeEndpointReconciler struct{}
-
-func (*fakeEndpointReconciler) ReconcileEndpoints(serviceName string, ip net.IP, endpointPorts []api.EndpointPort, reconcilePorts bool) error {
-	return nil
-}
-
 func makeNodeList(nodes []string, nodeResources apiv1.NodeResources) *apiv1.NodeList {
 	list := apiv1.NodeList{
 		Items: make([]apiv1.Node, len(nodes)),
@@ -186,7 +247,7 @@ func makeNodeList(nodes []string, nodeResources apiv1.NodeResources) *apiv1.Node
 func TestGetNodeAddresses(t *testing.T) {
 	assert := assert.New(t)
 
-	fakeNodeClient := fake.NewSimpleClientset(makeNodeList([]string{"node1", "node2"}, apiv1.NodeResources{})).Core().Nodes()
+	fakeNodeClient := fake.NewSimpleClientset(makeNodeList([]string{"node1", "node2"}, apiv1.NodeResources{})).CoreV1().Nodes()
 	addressProvider := nodeAddressProvider{fakeNodeClient}
 
 	// Fail case (no addresses associated with nodes)
@@ -205,16 +266,22 @@ func TestGetNodeAddresses(t *testing.T) {
 	addrs, err = addressProvider.externalAddresses()
 	assert.NoError(err, "addresses should not have returned an error.")
 	assert.Equal([]string{"127.0.0.1", "127.0.0.1"}, addrs)
+}
 
-	// Pass case with LegacyHost type IP
-	nodes, _ = fakeNodeClient.List(metav1.ListOptions{})
-	for index := range nodes.Items {
-		nodes.Items[index].Status.Addresses = []apiv1.NodeAddress{{Type: apiv1.NodeLegacyHostIP, Address: "127.0.0.2"}}
-		fakeNodeClient.Update(&nodes.Items[index])
-	}
-	addrs, err = addressProvider.externalAddresses()
-	assert.NoError(err, "addresses failback should not have returned an error.")
-	assert.Equal([]string{"127.0.0.2", "127.0.0.2"}, addrs)
+func TestGetNodeAddressesWithOnlySomeExternalIP(t *testing.T) {
+	assert := assert.New(t)
+
+	fakeNodeClient := fake.NewSimpleClientset(makeNodeList([]string{"node1", "node2", "node3"}, apiv1.NodeResources{})).CoreV1().Nodes()
+	addressProvider := nodeAddressProvider{fakeNodeClient}
+
+	// Pass case with 1 External type IP (index == 1) and nodes (indexes 0 & 2) have no External IP.
+	nodes, _ := fakeNodeClient.List(metav1.ListOptions{})
+	nodes.Items[1].Status.Addresses = []apiv1.NodeAddress{{Type: apiv1.NodeExternalIP, Address: "127.0.0.1"}}
+	fakeNodeClient.Update(&nodes.Items[1])
+
+	addrs, err := addressProvider.externalAddresses()
+	assert.NoError(err, "addresses should not have returned an error.")
+	assert.Equal([]string{"127.0.0.1"}, addrs)
 }
 
 func decodeResponse(resp *http.Response, obj interface{}) error {
@@ -236,7 +303,7 @@ func TestAPIVersionOfDiscoveryEndpoints(t *testing.T) {
 	master, etcdserver, _, assert := newMaster(t)
 	defer etcdserver.Terminate(t)
 
-	server := httptest.NewServer(master.GenericAPIServer.HandlerContainer.ServeMux)
+	server := httptest.NewServer(master.GenericAPIServer.Handler.GoRestfulContainer.ServeMux)
 
 	// /api exists in release-1.1
 	resp, err := http.Get(server.URL + "/api")
@@ -304,4 +371,120 @@ func TestAPIVersionOfDiscoveryEndpoints(t *testing.T) {
 	assert.NoError(decodeResponse(resp, &resourceList))
 	assert.Equal(resourceList.APIVersion, "v1")
 
+}
+
+// This test doesn't cover the apiregistration and apiextensions group, as they are installed by other apiservers.
+func TestStorageVersionHashes(t *testing.T) {
+	master, etcdserver, _, _ := newMaster(t)
+	defer etcdserver.Terminate(t)
+
+	server := httptest.NewServer(master.GenericAPIServer.Handler.GoRestfulContainer.ServeMux)
+
+	c := &restclient.Config{
+		Host:          server.URL,
+		APIPath:       "/api",
+		ContentConfig: restclient.ContentConfig{NegotiatedSerializer: legacyscheme.Codecs},
+	}
+	discover := discovery.NewDiscoveryClientForConfigOrDie(c)
+	all, err := discover.ServerResources()
+	if err != nil {
+		t.Error(err)
+	}
+	var count int
+	for _, g := range all {
+		for _, r := range g.APIResources {
+			if strings.Contains(r.Name, "/") ||
+				storageversionhashdata.NoStorageVersionHash.Has(g.GroupVersion+"/"+r.Name) {
+				if r.StorageVersionHash != "" {
+					t.Errorf("expect resource %s/%s to have empty storageVersionHash, got hash %q", g.GroupVersion, r.Name, r.StorageVersionHash)
+				}
+				continue
+			}
+			if r.StorageVersionHash == "" {
+				t.Errorf("expect the storageVersionHash of %s/%s to exist", g.GroupVersion, r.Name)
+				continue
+			}
+			// Uncomment the following line if you want to update storageversionhash/data.go
+			// fmt.Printf("\"%s/%s\": \"%s\",\n", g.GroupVersion, r.Name, r.StorageVersionHash)
+			expected := storageversionhashdata.GVRToStorageVersionHash[g.GroupVersion+"/"+r.Name]
+			if r.StorageVersionHash != expected {
+				t.Errorf("expect the storageVersionHash of %s/%s to be %q, got %q", g.GroupVersion, r.Name, expected, r.StorageVersionHash)
+			}
+			count++
+		}
+	}
+	if count != len(storageversionhashdata.GVRToStorageVersionHash) {
+		t.Errorf("please remove the redundant entries from GVRToStorageVersionHash")
+	}
+}
+
+func TestStorageVersionHashEqualities(t *testing.T) {
+	master, etcdserver, _, assert := newMaster(t)
+	defer etcdserver.Terminate(t)
+
+	server := httptest.NewServer(master.GenericAPIServer.Handler.GoRestfulContainer.ServeMux)
+
+	// Test 1: extensions/v1beta1/replicasets and apps/v1/replicasets have
+	// the same storage version hash.
+	resp, err := http.Get(server.URL + "/apis/extensions/v1beta1")
+	assert.Empty(err)
+	extList := metav1.APIResourceList{}
+	assert.NoError(decodeResponse(resp, &extList))
+	var extReplicasetHash, appsReplicasetHash string
+	for _, r := range extList.APIResources {
+		if r.Name == "replicasets" {
+			extReplicasetHash = r.StorageVersionHash
+			assert.NotEmpty(extReplicasetHash)
+		}
+	}
+
+	resp, err = http.Get(server.URL + "/apis/apps/v1")
+	assert.Empty(err)
+	appsList := metav1.APIResourceList{}
+	assert.NoError(decodeResponse(resp, &appsList))
+	for _, r := range appsList.APIResources {
+		if r.Name == "replicasets" {
+			appsReplicasetHash = r.StorageVersionHash
+			assert.NotEmpty(appsReplicasetHash)
+		}
+	}
+	if len(extReplicasetHash) > 0 && len(appsReplicasetHash) > 0 {
+		assert.Equal(extReplicasetHash, appsReplicasetHash)
+	}
+
+	// Test 2: batch/v1/jobs and batch/v1beta1/cronjobs have different
+	// storage version hashes.
+	resp, err = http.Get(server.URL + "/apis/batch/v1")
+	assert.Empty(err)
+	batchv1 := metav1.APIResourceList{}
+	assert.NoError(decodeResponse(resp, &batchv1))
+	var jobsHash string
+	for _, r := range batchv1.APIResources {
+		if r.Name == "jobs" {
+			jobsHash = r.StorageVersionHash
+		}
+	}
+	assert.NotEmpty(jobsHash)
+
+	resp, err = http.Get(server.URL + "/apis/batch/v1beta1")
+	assert.Empty(err)
+	batchv1beta1 := metav1.APIResourceList{}
+	assert.NoError(decodeResponse(resp, &batchv1beta1))
+	var cronjobsHash string
+	for _, r := range batchv1beta1.APIResources {
+		if r.Name == "cronjobs" {
+			cronjobsHash = r.StorageVersionHash
+		}
+	}
+	assert.NotEmpty(cronjobsHash)
+	assert.NotEqual(jobsHash, cronjobsHash)
+}
+
+func TestNoAlphaVersionsEnabledByDefault(t *testing.T) {
+	config := DefaultAPIResourceConfigSource()
+	for gv, enable := range config.GroupVersionConfigs {
+		if enable && strings.Contains(gv.Version, "alpha") {
+			t.Errorf("Alpha API version %s enabled by default", gv.String())
+		}
+	}
 }

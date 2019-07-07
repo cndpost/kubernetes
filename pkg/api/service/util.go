@@ -18,21 +18,18 @@ package service
 
 import (
 	"fmt"
-	"strconv"
 	"strings"
 
-	"k8s.io/kubernetes/pkg/api"
-	netsets "k8s.io/kubernetes/pkg/util/net/sets"
-
-	"github.com/golang/glog"
+	api "k8s.io/kubernetes/pkg/apis/core"
+	utilnet "k8s.io/utils/net"
 )
 
 const (
 	defaultLoadBalancerSourceRanges = "0.0.0.0/0"
 )
 
-// IsAllowAll checks whether the netsets.IPNet allows traffic from 0.0.0.0/0
-func IsAllowAll(ipnets netsets.IPNet) bool {
+// IsAllowAll checks whether the utilnet.IPNet allows traffic from 0.0.0.0/0
+func IsAllowAll(ipnets utilnet.IPNetSet) bool {
 	for _, s := range ipnets.StringSlice() {
 		if s == "0.0.0.0/0" {
 			return true
@@ -44,27 +41,27 @@ func IsAllowAll(ipnets netsets.IPNet) bool {
 // GetLoadBalancerSourceRanges first try to parse and verify LoadBalancerSourceRanges field from a service.
 // If the field is not specified, turn to parse and verify the AnnotationLoadBalancerSourceRangesKey annotation from a service,
 // extracting the source ranges to allow, and if not present returns a default (allow-all) value.
-func GetLoadBalancerSourceRanges(service *api.Service) (netsets.IPNet, error) {
-	var ipnets netsets.IPNet
+func GetLoadBalancerSourceRanges(service *api.Service) (utilnet.IPNetSet, error) {
+	var ipnets utilnet.IPNetSet
 	var err error
 	// if SourceRange field is specified, ignore sourceRange annotation
 	if len(service.Spec.LoadBalancerSourceRanges) > 0 {
 		specs := service.Spec.LoadBalancerSourceRanges
-		ipnets, err = netsets.ParseIPNets(specs...)
+		ipnets, err = utilnet.ParseIPNets(specs...)
 
 		if err != nil {
 			return nil, fmt.Errorf("service.Spec.LoadBalancerSourceRanges: %v is not valid. Expecting a list of IP ranges. For example, 10.0.0.0/24. Error msg: %v", specs, err)
 		}
 	} else {
-		val := service.Annotations[AnnotationLoadBalancerSourceRangesKey]
+		val := service.Annotations[api.AnnotationLoadBalancerSourceRangesKey]
 		val = strings.TrimSpace(val)
 		if val == "" {
 			val = defaultLoadBalancerSourceRanges
 		}
 		specs := strings.Split(val, ",")
-		ipnets, err = netsets.ParseIPNets(specs...)
+		ipnets, err = utilnet.ParseIPNets(specs...)
 		if err != nil {
-			return nil, fmt.Errorf("%s: %s is not valid. Expecting a comma-separated list of source IP ranges. For example, 10.0.0.0/24,192.168.2.0/24", AnnotationLoadBalancerSourceRangesKey, val)
+			return nil, fmt.Errorf("%s: %s is not valid. Expecting a comma-separated list of source IP ranges. For example, 10.0.0.0/24,192.168.2.0/24", api.AnnotationLoadBalancerSourceRangesKey, val)
 		}
 	}
 	return ipnets, nil
@@ -76,51 +73,14 @@ func RequestsOnlyLocalTraffic(service *api.Service) bool {
 		service.Spec.Type != api.ServiceTypeNodePort {
 		return false
 	}
-	// First check the alpha annotation and then the beta. This is so existing
-	// Services continue to work till the user decides to transition to beta.
-	// If they transition to beta, there's no way to go back to alpha without
-	// rolling back the cluster.
-	for _, annotation := range []string{AlphaAnnotationExternalTraffic, BetaAnnotationExternalTraffic} {
-		if l, ok := service.Annotations[annotation]; ok {
-			switch l {
-			case AnnotationValueExternalTrafficLocal:
-				return true
-			case AnnotationValueExternalTrafficGlobal:
-				return false
-			default:
-				glog.Errorf("Invalid value for annotation %v: %v", annotation, l)
-			}
-		}
-	}
-	return false
+
+	return service.Spec.ExternalTrafficPolicy == api.ServiceExternalTrafficPolicyTypeLocal
 }
 
-// NeedsHealthCheck Check if service needs health check.
+// NeedsHealthCheck checks if service needs health check.
 func NeedsHealthCheck(service *api.Service) bool {
 	if service.Spec.Type != api.ServiceTypeLoadBalancer {
 		return false
 	}
 	return RequestsOnlyLocalTraffic(service)
-}
-
-// GetServiceHealthCheckNodePort Return health check node port annotation for service, if one exists
-func GetServiceHealthCheckNodePort(service *api.Service) int32 {
-	if !NeedsHealthCheck(service) {
-		return 0
-	}
-	// First check the alpha annotation and then the beta. This is so existing
-	// Services continue to work till the user decides to transition to beta.
-	// If they transition to beta, there's no way to go back to alpha without
-	// rolling back the cluster.
-	for _, annotation := range []string{AlphaAnnotationHealthCheckNodePort, BetaAnnotationHealthCheckNodePort} {
-		if l, ok := service.Annotations[annotation]; ok {
-			p, err := strconv.Atoi(l)
-			if err != nil {
-				glog.Errorf("Failed to parse annotation %v: %v", annotation, err)
-				continue
-			}
-			return int32(p)
-		}
-	}
-	return 0
 }

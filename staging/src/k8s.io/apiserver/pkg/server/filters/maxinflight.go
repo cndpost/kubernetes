@@ -19,36 +19,88 @@ package filters
 import (
 	"fmt"
 	"net/http"
+	"sync"
+	"time"
 
-	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apiserver/pkg/authentication/user"
+	"k8s.io/apiserver/pkg/endpoints/metrics"
 	apirequest "k8s.io/apiserver/pkg/endpoints/request"
-	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
-	"k8s.io/apiserver/pkg/server/httplog"
 
-	"github.com/golang/glog"
+	"k8s.io/klog"
 )
 
-// Constant for the retry-after interval on rate limiting.
-// TODO: maybe make this dynamic? or user-adjustable?
-const retryAfter = "1"
+const (
+	// Constant for the retry-after interval on rate limiting.
+	// TODO: maybe make this dynamic? or user-adjustable?
+	retryAfter = "1"
+
+	// How often inflight usage metric should be updated. Because
+	// the metrics tracks maximal value over period making this
+	// longer will increase the metric value.
+	inflightUsageMetricUpdatePeriod = time.Second
+)
 
 var nonMutatingRequestVerbs = sets.NewString("get", "list", "watch")
 
 func handleError(w http.ResponseWriter, r *http.Request, err error) {
-	w.WriteHeader(http.StatusInternalServerError)
-	fmt.Fprintf(w, "Internal Server Error: %#v", r.RequestURI)
-	glog.Errorf(err.Error())
+	errorMsg := fmt.Sprintf("Internal Server Error: %#v", r.RequestURI)
+	http.Error(w, errorMsg, http.StatusInternalServerError)
+	klog.Errorf(err.Error())
 }
+
+// requestWatermark is used to trak maximal usage of inflight requests.
+type requestWatermark struct {
+	lock                                 sync.Mutex
+	readOnlyWatermark, mutatingWatermark int
+}
+
+func (w *requestWatermark) recordMutating(mutatingVal int) {
+	w.lock.Lock()
+	defer w.lock.Unlock()
+
+	if w.mutatingWatermark < mutatingVal {
+		w.mutatingWatermark = mutatingVal
+	}
+}
+
+func (w *requestWatermark) recordReadOnly(readOnlyVal int) {
+	w.lock.Lock()
+	defer w.lock.Unlock()
+
+	if w.readOnlyWatermark < readOnlyVal {
+		w.readOnlyWatermark = readOnlyVal
+	}
+}
+
+var watermark = &requestWatermark{}
+
+func startRecordingUsage() {
+	go func() {
+		wait.Forever(func() {
+			watermark.lock.Lock()
+			readOnlyWatermark := watermark.readOnlyWatermark
+			mutatingWatermark := watermark.mutatingWatermark
+			watermark.readOnlyWatermark = 0
+			watermark.mutatingWatermark = 0
+			watermark.lock.Unlock()
+
+			metrics.UpdateInflightRequestMetrics(readOnlyWatermark, mutatingWatermark)
+		}, inflightUsageMetricUpdatePeriod)
+	}()
+}
+
+var startOnce sync.Once
 
 // WithMaxInFlightLimit limits the number of in-flight requests to buffer size of the passed in channel.
 func WithMaxInFlightLimit(
 	handler http.Handler,
 	nonMutatingLimit int,
 	mutatingLimit int,
-	requestContextMapper genericapirequest.RequestContextMapper,
-	longRunningRequestCheck LongRunningRequestCheck,
+	longRunningRequestCheck apirequest.LongRunningRequestCheck,
 ) http.Handler {
+	startOnce.Do(startRecordingUsage)
 	if nonMutatingLimit == 0 && mutatingLimit == 0 {
 		return handler
 	}
@@ -62,11 +114,7 @@ func WithMaxInFlightLimit(
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx, ok := requestContextMapper.Get(r)
-		if !ok {
-			handleError(w, r, fmt.Errorf("no context found for request, handler chain must be wrong"))
-			return
-		}
+		ctx := r.Context()
 		requestInfo, ok := apirequest.RequestInfoFrom(ctx)
 		if !ok {
 			handleError(w, r, fmt.Errorf("no RequestInfo found in context, handler chain must be wrong"))
@@ -80,7 +128,8 @@ func WithMaxInFlightLimit(
 		}
 
 		var c chan bool
-		if !nonMutatingRequestVerbs.Has(requestInfo.Verb) {
+		isMutatingRequest := !nonMutatingRequestVerbs.Has(requestInfo.Verb)
+		if isMutatingRequest {
 			c = mutatingChan
 		} else {
 			c = nonMutatingChan
@@ -89,11 +138,47 @@ func WithMaxInFlightLimit(
 		if c == nil {
 			handler.ServeHTTP(w, r)
 		} else {
+
 			select {
 			case c <- true:
-				defer func() { <-c }()
+				var mutatingLen, readOnlyLen int
+				if isMutatingRequest {
+					mutatingLen = len(mutatingChan)
+				} else {
+					readOnlyLen = len(nonMutatingChan)
+				}
+
+				defer func() {
+					<-c
+					if isMutatingRequest {
+						watermark.recordMutating(mutatingLen)
+					} else {
+						watermark.recordReadOnly(readOnlyLen)
+					}
+
+				}()
 				handler.ServeHTTP(w, r)
+
 			default:
+				// We need to split this data between buckets used for throttling.
+				if isMutatingRequest {
+					metrics.DroppedRequests.WithLabelValues(metrics.MutatingKind).Inc()
+					metrics.DeprecatedDroppedRequests.WithLabelValues(metrics.MutatingKind).Inc()
+				} else {
+					metrics.DroppedRequests.WithLabelValues(metrics.ReadOnlyKind).Inc()
+					metrics.DeprecatedDroppedRequests.WithLabelValues(metrics.ReadOnlyKind).Inc()
+				}
+				// at this point we're about to return a 429, BUT not all actors should be rate limited.  A system:master is so powerful
+				// that they should always get an answer.  It's a super-admin or a loopback connection.
+				if currUser, ok := apirequest.UserFrom(ctx); ok {
+					for _, group := range currUser.GetGroups() {
+						if group == user.SystemPrivilegedGroup {
+							handler.ServeHTTP(w, r)
+							return
+						}
+					}
+				}
+				metrics.Record(r, requestInfo, metrics.APIServerComponent, "", http.StatusTooManyRequests, 0, 0)
 				tooManyRequests(r, w)
 			}
 		}
@@ -101,11 +186,7 @@ func WithMaxInFlightLimit(
 }
 
 func tooManyRequests(req *http.Request, w http.ResponseWriter) {
-	// "Too Many Requests" response is returned before logger is setup for the request.
-	// So we need to explicitly log it here.
-	defer httplog.NewLogged(req, &w).Log()
-
 	// Return a 429 status indicating "Too Many Requests"
 	w.Header().Set("Retry-After", retryAfter)
-	http.Error(w, "Too many requests, please try again later.", errors.StatusTooManyRequests)
+	http.Error(w, "Too many requests, please try again later.", http.StatusTooManyRequests)
 }

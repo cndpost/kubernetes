@@ -27,29 +27,12 @@ import (
 	"k8s.io/kubernetes/pkg/util/mount"
 )
 
-type fakeMounter struct{}
+type fakeMounter struct {
+	mount.FakeMounter
+}
 
-var _ mount.Interface = &fakeMounter{}
-
-func (mounter *fakeMounter) Mount(source string, target string, fstype string, options []string) error {
-	return errors.New("not implemented")
-}
-func (mounter *fakeMounter) Unmount(target string) error {
-	return errors.New("not implemented")
-}
-func (mounter *fakeMounter) List() ([]mount.MountPoint, error) {
-	return nil, errors.New("not implemented")
-}
-func (mounter fakeMounter) DeviceOpened(pathname string) (bool, error) {
-	return false, errors.New("not implemented")
-}
-func (mounter *fakeMounter) PathIsDevice(pathname string) (bool, error) {
-	return false, errors.New("not implemented")
-}
-func (mounter *fakeMounter) GetDeviceNameFromMount(mountPath, pluginDir string) (string, error) {
-	return "", errors.New("not implemented")
-}
-func (mounter *fakeMounter) IsLikelyNotMountPoint(file string) (bool, error) {
+// IsLikelyNotMountPoint overrides mount.FakeMounter.IsLikelyNotMountPoint for our use.
+func (f *fakeMounter) IsLikelyNotMountPoint(file string) (bool, error) {
 	name := path.Base(file)
 	if strings.HasPrefix(name, "mount") {
 		return false, nil

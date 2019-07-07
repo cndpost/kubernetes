@@ -1,3 +1,5 @@
+# See the OWNERS docs at https://go.k8s.io/owners
+
 approvers:
 - caesarxuchao
 - deads2k
@@ -18,13 +20,11 @@ reviewers:
 - mikedanese
 - liggitt
 - nikhiljindal
-- bprashanth
 - gmarek
 - erictune
 - davidopp
 - pmorie
 - sttts
-- kargakis
 - dchen1107
 - saad-ali
 - zmerlynn
@@ -33,7 +33,7 @@ reviewers:
 - justinsb
 - roberthbailey
 - ncdc
-- timstclair
+- tallclair
 - yifan-gu
 - eparis
 - mwielgus

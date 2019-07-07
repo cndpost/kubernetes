@@ -1,32 +1,36 @@
 //
 // Copyright (c) 2015 The heketi Authors
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// This file is licensed to you under your choice of the GNU Lesser
+// General Public License, version 3 or any later version (LGPLv3 or
+// later), as published by the Free Software Foundation,
+// or under the Apache License, Version 2.0 <LICENSE-APACHE2 or
+// http://www.apache.org/licenses/LICENSE-2.0>.
 //
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// You may not use this file except in compliance with those terms.
 //
 
 package client
 
 import (
 	"bytes"
+	"encoding/json"
+	"net/http"
+
 	"github.com/heketi/heketi/pkg/glusterfs/api"
 	"github.com/heketi/heketi/pkg/utils"
-	"net/http"
 )
 
-func (c *Client) ClusterCreate() (*api.ClusterInfoResponse, error) {
+func (c *Client) ClusterCreate(request *api.ClusterCreateRequest) (*api.ClusterInfoResponse, error) {
+
+	buffer, err := json.Marshal(request)
+	if err != nil {
+		return nil, err
+	}
 
 	// Create a request
-	req, err := http.NewRequest("POST", c.host+"/clusters", bytes.NewBuffer([]byte(`{}`)))
+	req, err := http.NewRequest("POST", c.host+"/clusters",
+		bytes.NewBuffer(buffer))
 	if err != nil {
 		return nil, err
 	}
@@ -43,6 +47,7 @@ func (c *Client) ClusterCreate() (*api.ClusterInfoResponse, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer r.Body.Close()
 	if r.StatusCode != http.StatusCreated {
 		return nil, utils.GetErrorFromResponse(r)
 	}
@@ -50,12 +55,45 @@ func (c *Client) ClusterCreate() (*api.ClusterInfoResponse, error) {
 	// Read JSON response
 	var cluster api.ClusterInfoResponse
 	err = utils.GetJsonFromResponse(r, &cluster)
-	r.Body.Close()
 	if err != nil {
 		return nil, err
 	}
 
 	return &cluster, nil
+}
+
+func (c *Client) ClusterSetFlags(id string, request *api.ClusterSetFlagsRequest) error {
+
+	buffer, err := json.Marshal(request)
+	if err != nil {
+		return err
+	}
+
+	// Create a request
+	req, err := http.NewRequest("POST", c.host+"/clusters/"+id+"/flags",
+		bytes.NewBuffer(buffer))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	// Set token
+	err = c.setToken(req)
+	if err != nil {
+		return err
+	}
+
+	// Send request
+	r, err := c.do(req)
+	if err != nil {
+		return err
+	}
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		return utils.GetErrorFromResponse(r)
+	}
+
+	return nil
 }
 
 func (c *Client) ClusterInfo(id string) (*api.ClusterInfoResponse, error) {
@@ -77,6 +115,7 @@ func (c *Client) ClusterInfo(id string) (*api.ClusterInfoResponse, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer r.Body.Close()
 	if r.StatusCode != http.StatusOK {
 		return nil, utils.GetErrorFromResponse(r)
 	}
@@ -84,7 +123,6 @@ func (c *Client) ClusterInfo(id string) (*api.ClusterInfoResponse, error) {
 	// Read JSON response
 	var cluster api.ClusterInfoResponse
 	err = utils.GetJsonFromResponse(r, &cluster)
-	r.Body.Close()
 	if err != nil {
 		return nil, err
 	}
@@ -111,6 +149,7 @@ func (c *Client) ClusterList() (*api.ClusterListResponse, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer r.Body.Close()
 	if r.StatusCode != http.StatusOK {
 		return nil, utils.GetErrorFromResponse(r)
 	}
@@ -144,6 +183,7 @@ func (c *Client) ClusterDelete(id string) error {
 	if err != nil {
 		return err
 	}
+	defer r.Body.Close()
 	if r.StatusCode != http.StatusOK {
 		return utils.GetErrorFromResponse(r)
 	}

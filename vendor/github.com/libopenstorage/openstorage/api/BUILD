@@ -1,11 +1,4 @@
-package(default_visibility = ["//visibility:public"])
-
-licenses(["notice"])
-
-load(
-    "@io_bazel_rules_go//go:def.bzl",
-    "go_library",
-)
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "go_default_library",
@@ -14,10 +7,13 @@ go_library(
         "api.pb.go",
         "status.go",
     ],
-    tags = ["automanaged"],
+    importmap = "k8s.io/kubernetes/vendor/github.com/libopenstorage/openstorage/api",
+    importpath = "github.com/libopenstorage/openstorage/api",
+    visibility = ["//visibility:public"],
     deps = [
         "//vendor/github.com/golang/protobuf/proto:go_default_library",
-        "//vendor/go.pedge.io/pb/go/google/protobuf:go_default_library",
+        "//vendor/github.com/golang/protobuf/ptypes/timestamp:go_default_library",
+        "//vendor/github.com/mohae/deepcopy:go_default_library",
     ],
 )
 
@@ -36,4 +32,5 @@ filegroup(
         "//vendor/github.com/libopenstorage/openstorage/api/spec:all-srcs",
     ],
     tags = ["automanaged"],
+    visibility = ["//visibility:public"],
 )

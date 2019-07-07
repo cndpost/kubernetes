@@ -19,8 +19,8 @@ package kuberuntime
 import (
 	"fmt"
 
-	"k8s.io/kubernetes/pkg/api/v1"
-	runtimeapi "k8s.io/kubernetes/pkg/kubelet/api/v1alpha1/runtime"
+	"k8s.io/api/core/v1"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 	"k8s.io/kubernetes/pkg/security/apparmor"
 	"k8s.io/kubernetes/pkg/securitycontext"
 )
@@ -30,8 +30,14 @@ func (m *kubeGenericRuntimeManager) determineEffectiveSecurityContext(pod *v1.Po
 	effectiveSc := securitycontext.DetermineEffectiveSecurityContext(pod, container)
 	synthesized := convertToRuntimeSecurityContext(effectiveSc)
 	if synthesized == nil {
-		synthesized = &runtimeapi.LinuxContainerSecurityContext{}
+		synthesized = &runtimeapi.LinuxContainerSecurityContext{
+			MaskedPaths:   securitycontext.ConvertToRuntimeMaskedPaths(effectiveSc.ProcMount),
+			ReadonlyPaths: securitycontext.ConvertToRuntimeReadonlyPaths(effectiveSc.ProcMount),
+		}
 	}
+
+	// set SeccompProfilePath.
+	synthesized.SeccompProfilePath = m.getSeccompProfileFromAnnotations(pod.Annotations, container.Name)
 
 	// set ApparmorProfile.
 	synthesized.ApparmorProfile = apparmor.GetProfileNameFromPodAnnotations(pod.Annotations, container.Name)
@@ -45,32 +51,36 @@ func (m *kubeGenericRuntimeManager) determineEffectiveSecurityContext(pod *v1.Po
 	}
 
 	// set namespace options and supplemental groups.
-	synthesized.NamespaceOptions = &runtimeapi.NamespaceOption{
-		HostNetwork: pod.Spec.HostNetwork,
-		HostIpc:     pod.Spec.HostIPC,
-		HostPid:     pod.Spec.HostPID,
-	}
+	synthesized.NamespaceOptions = namespacesForPod(pod)
 	podSc := pod.Spec.SecurityContext
 	if podSc != nil {
 		if podSc.FSGroup != nil {
-			synthesized.SupplementalGroups = append(synthesized.SupplementalGroups, *podSc.FSGroup)
+			synthesized.SupplementalGroups = append(synthesized.SupplementalGroups, int64(*podSc.FSGroup))
 		}
 
 		if podSc.SupplementalGroups != nil {
-			synthesized.SupplementalGroups = append(synthesized.SupplementalGroups, podSc.SupplementalGroups...)
+			for _, sg := range podSc.SupplementalGroups {
+				synthesized.SupplementalGroups = append(synthesized.SupplementalGroups, int64(sg))
+			}
 		}
 	}
 	if groups := m.runtimeHelper.GetExtraSupplementalGroupsForPod(pod); len(groups) > 0 {
 		synthesized.SupplementalGroups = append(synthesized.SupplementalGroups, groups...)
 	}
 
+	synthesized.NoNewPrivs = securitycontext.AddNoNewPrivileges(effectiveSc)
+
+	synthesized.MaskedPaths = securitycontext.ConvertToRuntimeMaskedPaths(effectiveSc.ProcMount)
+	synthesized.ReadonlyPaths = securitycontext.ConvertToRuntimeReadonlyPaths(effectiveSc.ProcMount)
+
 	return synthesized
 }
 
 // verifyRunAsNonRoot verifies RunAsNonRoot.
-func verifyRunAsNonRoot(pod *v1.Pod, container *v1.Container, uid int64) error {
+func verifyRunAsNonRoot(pod *v1.Pod, container *v1.Container, uid *int64, username string) error {
 	effectiveSc := securitycontext.DetermineEffectiveSecurityContext(pod, container)
-	if effectiveSc == nil || effectiveSc.RunAsNonRoot == nil {
+	// If the option is not set, or if running as root is allowed, return nil.
+	if effectiveSc == nil || effectiveSc.RunAsNonRoot == nil || !*effectiveSc.RunAsNonRoot {
 		return nil
 	}
 
@@ -81,11 +91,14 @@ func verifyRunAsNonRoot(pod *v1.Pod, container *v1.Container, uid int64) error {
 		return nil
 	}
 
-	if uid == 0 {
+	switch {
+	case uid != nil && *uid == 0:
 		return fmt.Errorf("container has runAsNonRoot and image will run as root")
+	case uid == nil && len(username) > 0:
+		return fmt.Errorf("container has runAsNonRoot and image has non-numeric user (%s), cannot verify user is non-root", username)
+	default:
+		return nil
 	}
-
-	return nil
 }
 
 // convertToRuntimeSecurityContext converts v1.SecurityContext to runtimeapi.SecurityContext.
@@ -99,7 +112,10 @@ func convertToRuntimeSecurityContext(securityContext *v1.SecurityContext) *runti
 		SelinuxOptions: convertToRuntimeSELinuxOption(securityContext.SELinuxOptions),
 	}
 	if securityContext.RunAsUser != nil {
-		sc.RunAsUser = &runtimeapi.Int64Value{Value: *securityContext.RunAsUser}
+		sc.RunAsUser = &runtimeapi.Int64Value{Value: int64(*securityContext.RunAsUser)}
+	}
+	if securityContext.RunAsGroup != nil {
+		sc.RunAsGroup = &runtimeapi.Int64Value{Value: int64(*securityContext.RunAsGroup)}
 	}
 	if securityContext.Privileged != nil {
 		sc.Privileged = *securityContext.Privileged

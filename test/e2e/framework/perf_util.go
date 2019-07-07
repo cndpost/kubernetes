@@ -19,19 +19,20 @@ package framework
 import (
 	"fmt"
 
+	e2elog "k8s.io/kubernetes/test/e2e/framework/log"
 	"k8s.io/kubernetes/test/e2e/perftype"
 )
 
 // TODO(random-liu): Change the tests to actually use PerfData from the beginning instead of
 // translating one to the other here.
 
-// currentApiCallMetricsVersion is the current apicall performance metrics version. We should
+// currentAPICallMetricsVersion is the current apicall performance metrics version. We should
 // bump up the version each time we make incompatible change to the metrics.
-const currentApiCallMetricsVersion = "v1"
+const currentAPICallMetricsVersion = "v1"
 
-// ApiCallToPerfData transforms APIResponsiveness to PerfData.
-func ApiCallToPerfData(apicalls APIResponsiveness) *perftype.PerfData {
-	perfData := &perftype.PerfData{Version: currentApiCallMetricsVersion}
+// APICallToPerfData transforms APIResponsiveness to PerfData.
+func APICallToPerfData(apicalls *APIResponsiveness) *perftype.PerfData {
+	perfData := &perftype.PerfData{Version: currentAPICallMetricsVersion}
 	for _, apicall := range apicalls.APICalls {
 		item := perftype.DataItem{
 			Data: map[string]float64{
@@ -41,8 +42,11 @@ func ApiCallToPerfData(apicalls APIResponsiveness) *perftype.PerfData {
 			},
 			Unit: "ms",
 			Labels: map[string]string{
-				"Verb":     apicall.Verb,
-				"Resource": apicall.Resource,
+				"Verb":        apicall.Verb,
+				"Resource":    apicall.Resource,
+				"Subresource": apicall.Subresource,
+				"Scope":       apicall.Scope,
+				"Count":       fmt.Sprintf("%v", apicall.Count),
 			},
 		}
 		perfData.DataItems = append(perfData.DataItems, item)
@@ -50,9 +54,36 @@ func ApiCallToPerfData(apicalls APIResponsiveness) *perftype.PerfData {
 	return perfData
 }
 
-// currentKubeletPerfMetricsVersion is the current kubelet performance metrics version. We should
-// bump up the version each time we make incompatible change to the metrics.
-const currentKubeletPerfMetricsVersion = "v2"
+func latencyToPerfData(l LatencyMetric, name string) perftype.DataItem {
+	return perftype.DataItem{
+		Data: map[string]float64{
+			"Perc50":  float64(l.Perc50) / 1000000, // us -> ms
+			"Perc90":  float64(l.Perc90) / 1000000,
+			"Perc99":  float64(l.Perc99) / 1000000,
+			"Perc100": float64(l.Perc100) / 1000000,
+		},
+		Unit: "ms",
+		Labels: map[string]string{
+			"Metric": name,
+		},
+	}
+}
+
+// PodStartupLatencyToPerfData transforms PodStartupLatency to PerfData.
+func PodStartupLatencyToPerfData(latency *PodStartupLatency) *perftype.PerfData {
+	perfData := &perftype.PerfData{Version: currentAPICallMetricsVersion}
+	perfData.DataItems = append(perfData.DataItems, latencyToPerfData(latency.CreateToScheduleLatency, "create_to_schedule"))
+	perfData.DataItems = append(perfData.DataItems, latencyToPerfData(latency.ScheduleToRunLatency, "schedule_to_run"))
+	perfData.DataItems = append(perfData.DataItems, latencyToPerfData(latency.RunToWatchLatency, "run_to_watch"))
+	perfData.DataItems = append(perfData.DataItems, latencyToPerfData(latency.ScheduleToWatchLatency, "schedule_to_watch"))
+	perfData.DataItems = append(perfData.DataItems, latencyToPerfData(latency.E2ELatency, "pod_startup"))
+	return perfData
+}
+
+// CurrentKubeletPerfMetricsVersion is the current kubelet performance metrics
+// version. This is used by mutiple perf related data structures. We should
+// bump up the version each time we make an incompatible change to the metrics.
+const CurrentKubeletPerfMetricsVersion = "v2"
 
 // ResourceUsageToPerfData transforms ResourceUsagePerNode to PerfData. Notice that this function
 // only cares about memory usage, because cpu usage information will be extracted from NodesCPUSummary.
@@ -70,7 +101,7 @@ func CPUUsageToPerfData(usagePerNode NodesCPUSummary) *perftype.PerfData {
 func PrintPerfData(p *perftype.PerfData) {
 	// Notice that we must make sure the perftype.PerfResultEnd is in a new line.
 	if str := PrettyPrintJSON(p); str != "" {
-		Logf("%s %s\n%s", perftype.PerfResultTag, str, perftype.PerfResultEnd)
+		e2elog.Logf("%s %s\n%s", perftype.PerfResultTag, str, perftype.PerfResultEnd)
 	}
 }
 
@@ -98,7 +129,7 @@ func ResourceUsageToPerfDataWithLabels(usagePerNode ResourceUsagePerNode, labels
 		}
 	}
 	return &perftype.PerfData{
-		Version:   currentKubeletPerfMetricsVersion,
+		Version:   CurrentKubeletPerfMetricsVersion,
 		DataItems: items,
 		Labels:    labels,
 	}
@@ -128,7 +159,7 @@ func CPUUsageToPerfDataWithLabels(usagePerNode NodesCPUSummary, labels map[strin
 		}
 	}
 	return &perftype.PerfData{
-		Version:   currentKubeletPerfMetricsVersion,
+		Version:   CurrentKubeletPerfMetricsVersion,
 		DataItems: items,
 		Labels:    labels,
 	}

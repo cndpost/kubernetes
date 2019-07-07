@@ -1,19 +1,17 @@
-package(default_visibility = ["//visibility:public"])
-
-licenses(["notice"])
-
-load(
-    "@io_bazel_rules_go//go:def.bzl",
-    "go_library",
-)
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "go_default_library",
     srcs = [
         "context.go",
         "go17.go",
+        "go19.go",
+        "pre_go17.go",
+        "pre_go19.go",
     ],
-    tags = ["automanaged"],
+    importmap = "k8s.io/kubernetes/vendor/golang.org/x/net/context",
+    importpath = "golang.org/x/net/context",
+    visibility = ["//visibility:public"],
 )
 
 filegroup(
@@ -30,4 +28,5 @@ filegroup(
         "//vendor/golang.org/x/net/context/ctxhttp:all-srcs",
     ],
     tags = ["automanaged"],
+    visibility = ["//visibility:public"],
 )

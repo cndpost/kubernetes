@@ -1,13 +1,17 @@
+# See the OWNERS docs at https://go.k8s.io/owners
+
 reviewers:
-  - ixdy
+  - bentheelder
+  - cblecker
+  - fejta
   - jbeda
   - lavalamp
+  - spiffxp
   - zmerlynn
-  - spxtr
 approvers:
-  - ixdy
+  - cblecker
+  - fejta
   - jbeda
   - lavalamp
-  - zmerlynn
   - mikedanese
-  - spxtr
+  - zmerlynn

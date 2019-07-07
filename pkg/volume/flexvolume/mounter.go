@@ -17,11 +17,11 @@ limitations under the License.
 package flexvolume
 
 import (
+	"os"
 	"strconv"
 
-	"k8s.io/kubernetes/pkg/util/exec"
-	"k8s.io/kubernetes/pkg/util/mount"
 	"k8s.io/kubernetes/pkg/volume"
+	"k8s.io/utils/exec"
 )
 
 // FlexVolumeMounter is the disk that will be exposed by this plugin.
@@ -29,13 +29,9 @@ type flexVolumeMounter struct {
 	*flexVolume
 	// Runner used to setup the volume.
 	runner exec.Interface
-	// blockDeviceMounter provides the interface to create filesystem if the
-	// filesystem doesn't exist.
-	blockDeviceMounter mount.Interface
 	// the considered volume spec
 	spec     *volume.Spec
 	readOnly bool
-	volume.MetricsNil
 }
 
 var _ volume.Mounter = &flexVolumeMounter{}
@@ -43,12 +39,12 @@ var _ volume.Mounter = &flexVolumeMounter{}
 // Mounter interface
 
 // SetUp creates new directory.
-func (f *flexVolumeMounter) SetUp(fsGroup *int64) error {
-	return f.SetUpAt(f.GetPath(), fsGroup)
+func (f *flexVolumeMounter) SetUp(mounterArgs volume.MounterArgs) error {
+	return f.SetUpAt(f.GetPath(), mounterArgs)
 }
 
 // SetUpAt creates new directory.
-func (f *flexVolumeMounter) SetUpAt(dir string, fsGroup *int64) error {
+func (f *flexVolumeMounter) SetUpAt(dir string, mounterArgs volume.MounterArgs) error {
 	// Mount only once.
 	alreadyMounted, err := prepareForMount(f.mounter, dir)
 	if err != nil {
@@ -65,29 +61,40 @@ func (f *flexVolumeMounter) SetUpAt(dir string, fsGroup *int64) error {
 
 	extraOptions := make(map[string]string)
 
+	// pod metadata
+	extraOptions[optionKeyPodName] = f.podName
+	extraOptions[optionKeyPodNamespace] = f.podNamespace
+	extraOptions[optionKeyPodUID] = string(f.podUID)
+	// service account metadata
+	extraOptions[optionKeyServiceAccountName] = f.podServiceAccountName
+
 	// Extract secret and pass it as options.
 	if err := addSecretsToOptions(extraOptions, f.spec, f.podNamespace, f.driverName, f.plugin.host); err != nil {
+		os.Remove(dir)
 		return err
 	}
 
 	// Implicit parameters
-	if fsGroup != nil {
-		extraOptions[optionFSGroup] = strconv.FormatInt(*fsGroup, 10)
+	if mounterArgs.FsGroup != nil {
+		extraOptions[optionFSGroup] = strconv.FormatInt(int64(*mounterArgs.FsGroup), 10)
 	}
 
 	call.AppendSpec(f.spec, f.plugin.host, extraOptions)
 
 	_, err = call.Run()
 	if isCmdNotSupportedErr(err) {
-		err = (*mounterDefaults)(f).SetUpAt(dir, fsGroup)
+		err = (*mounterDefaults)(f).SetUpAt(dir, mounterArgs)
 	}
 
 	if err != nil {
+		os.Remove(dir)
 		return err
 	}
 
 	if !f.readOnly {
-		volume.SetVolumeOwnership(f, fsGroup)
+		if f.plugin.capabilities.FSGroup {
+			volume.SetVolumeOwnership(f, mounterArgs.FsGroup)
+		}
 	}
 
 	return nil

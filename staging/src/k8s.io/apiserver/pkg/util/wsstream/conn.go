@@ -25,8 +25,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/golang/glog"
 	"golang.org/x/net/websocket"
+	"k8s.io/klog"
 
 	"k8s.io/apimachinery/pkg/util/runtime"
 )
@@ -87,7 +87,10 @@ var (
 // IsWebSocketRequest returns true if the incoming request contains connection upgrade headers
 // for WebSockets.
 func IsWebSocketRequest(req *http.Request) bool {
-	return connectionUpgradeRegex.MatchString(strings.ToLower(req.Header.Get("Connection"))) && strings.ToLower(req.Header.Get("Upgrade")) == "websocket"
+	if !strings.EqualFold(req.Header.Get("Upgrade"), "websocket") {
+		return false
+	}
+	return connectionUpgradeRegex.MatchString(strings.ToLower(req.Header.Get("Connection")))
 }
 
 // IgnoreReceives reads from a WebSocket until it is closed, then returns. If timeout is set, the
@@ -134,7 +137,7 @@ type ChannelProtocolConfig struct {
 // channels.
 func NewDefaultChannelProtocols(channels []ChannelType) map[string]ChannelProtocolConfig {
 	return map[string]ChannelProtocolConfig{
-		"": {Binary: true, Channels: channels},
+		"":                             {Binary: true, Channels: channels},
 		ChannelWebSocketProtocol:       {Binary: true, Channels: channels},
 		Base64ChannelWebSocketProtocol: {Binary: false, Channels: channels},
 	}
@@ -248,7 +251,7 @@ func (conn *Conn) handle(ws *websocket.Conn) {
 		var data []byte
 		if err := websocket.Message.Receive(ws, &data); err != nil {
 			if err != io.EOF {
-				glog.Errorf("Error on socket receive: %v", err)
+				klog.Errorf("Error on socket receive: %v", err)
 			}
 			break
 		}
@@ -261,11 +264,11 @@ func (conn *Conn) handle(ws *websocket.Conn) {
 		}
 		data = data[1:]
 		if int(channel) >= len(conn.channels) {
-			glog.V(6).Infof("Frame is targeted for a reader %d that is not valid, possible protocol error", channel)
+			klog.V(6).Infof("Frame is targeted for a reader %d that is not valid, possible protocol error", channel)
 			continue
 		}
 		if _, err := conn.channels[channel].DataFromSocket(data); err != nil {
-			glog.Errorf("Unable to write frame to %d: %v\n%s", channel, err, string(data))
+			klog.Errorf("Unable to write frame to %d: %v\n%s", channel, err, string(data))
 			continue
 		}
 	}

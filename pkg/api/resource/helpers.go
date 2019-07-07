@@ -22,53 +22,48 @@ import (
 	"strconv"
 
 	"k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/kubernetes/pkg/api"
+	api "k8s.io/kubernetes/pkg/apis/core"
 )
 
-// PodRequestsAndLimits returns a dictionary of all defined resources summed up for all
-// containers of the pod.
-func PodRequestsAndLimits(pod *api.Pod) (reqs map[api.ResourceName]resource.Quantity, limits map[api.ResourceName]resource.Quantity, err error) {
-	reqs, limits = map[api.ResourceName]resource.Quantity{}, map[api.ResourceName]resource.Quantity{}
-	for _, container := range pod.Spec.Containers {
-		for name, quantity := range container.Resources.Requests {
-			if value, ok := reqs[name]; !ok {
-				reqs[name] = *quantity.Copy()
-			} else {
-				value.Add(quantity)
-				reqs[name] = value
-			}
+// addResourceList adds the resources in newList to list
+func addResourceList(list, new api.ResourceList) {
+	for name, quantity := range new {
+		if value, ok := list[name]; !ok {
+			list[name] = *quantity.Copy()
+		} else {
+			value.Add(quantity)
+			list[name] = value
 		}
-		for name, quantity := range container.Resources.Limits {
-			if value, ok := limits[name]; !ok {
-				limits[name] = *quantity.Copy()
-			} else {
-				value.Add(quantity)
-				limits[name] = value
+	}
+}
+
+// maxResourceList sets list to the greater of list/newList for every resource
+// either list
+func maxResourceList(list, new api.ResourceList) {
+	for name, quantity := range new {
+		if value, ok := list[name]; !ok {
+			list[name] = *quantity.Copy()
+			continue
+		} else {
+			if quantity.Cmp(value) > 0 {
+				list[name] = *quantity.Copy()
 			}
 		}
 	}
+}
+
+// PodRequestsAndLimits returns a dictionary of all defined resources summed up for all
+// containers of the pod.
+func PodRequestsAndLimits(pod *api.Pod) (reqs api.ResourceList, limits api.ResourceList) {
+	reqs, limits = api.ResourceList{}, api.ResourceList{}
+	for _, container := range pod.Spec.Containers {
+		addResourceList(reqs, container.Resources.Requests)
+		addResourceList(limits, container.Resources.Limits)
+	}
 	// init containers define the minimum of any resource
 	for _, container := range pod.Spec.InitContainers {
-		for name, quantity := range container.Resources.Requests {
-			value, ok := reqs[name]
-			if !ok {
-				reqs[name] = *quantity.Copy()
-				continue
-			}
-			if quantity.Cmp(value) > 0 {
-				reqs[name] = *quantity.Copy()
-			}
-		}
-		for name, quantity := range container.Resources.Limits {
-			value, ok := limits[name]
-			if !ok {
-				limits[name] = *quantity.Copy()
-				continue
-			}
-			if quantity.Cmp(value) > 0 {
-				limits[name] = *quantity.Copy()
-			}
-		}
+		maxResourceList(reqs, container.Resources.Requests)
+		maxResourceList(limits, container.Resources.Limits)
 	}
 	return
 }
@@ -88,10 +83,14 @@ func ExtractContainerResourceValue(fs *api.ResourceFieldSelector, container *api
 		return convertResourceCPUToString(container.Resources.Limits.Cpu(), divisor)
 	case "limits.memory":
 		return convertResourceMemoryToString(container.Resources.Limits.Memory(), divisor)
+	case "limits.ephemeral-storage":
+		return convertResourceEphemeralStorageToString(container.Resources.Limits.StorageEphemeral(), divisor)
 	case "requests.cpu":
 		return convertResourceCPUToString(container.Resources.Requests.Cpu(), divisor)
 	case "requests.memory":
 		return convertResourceMemoryToString(container.Resources.Requests.Memory(), divisor)
+	case "requests.ephemeral-storage":
+		return convertResourceEphemeralStorageToString(container.Resources.Requests.StorageEphemeral(), divisor)
 	}
 
 	return "", fmt.Errorf("unsupported container resource : %v", fs.Resource)
@@ -108,5 +107,12 @@ func convertResourceCPUToString(cpu *resource.Quantity, divisor resource.Quantit
 // ceiling of the value.
 func convertResourceMemoryToString(memory *resource.Quantity, divisor resource.Quantity) (string, error) {
 	m := int64(math.Ceil(float64(memory.Value()) / float64(divisor.Value())))
+	return strconv.FormatInt(m, 10), nil
+}
+
+// convertResourceEphemeralStorageToString converts ephemeral storage value to the format of divisor and returns
+// ceiling of the value.
+func convertResourceEphemeralStorageToString(ephemeralStorage *resource.Quantity, divisor resource.Quantity) (string, error) {
+	m := int64(math.Ceil(float64(ephemeralStorage.Value()) / float64(divisor.Value())))
 	return strconv.FormatInt(m, 10), nil
 }

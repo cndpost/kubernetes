@@ -26,13 +26,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/golang/glog"
+	"k8s.io/klog"
 
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apiserver/pkg/server/httplog"
 	"k8s.io/apiserver/pkg/util/wsstream"
-	"k8s.io/kubernetes/pkg/api"
+	api "k8s.io/kubernetes/pkg/apis/core"
 )
 
 const (
@@ -43,15 +43,15 @@ const (
 	v4Base64WebsocketProtocol = "v4." + wsstream.Base64ChannelWebSocketProtocol
 )
 
-// options contains details about which streams are required for
-// port forwarding.
-// All fields incldued in V4Options need to be expressed explicilty in the
-// CRI (pkg/kubelet/api/{version}/runtime/api.proto) PortForwardRequest.
+// V4Options contains details about which streams are required for port
+// forwarding.
+// All fields included in V4Options need to be expressed explicitly in the
+// CRI (k8s.io/cri-api/pkg/apis/{version}/api.proto) PortForwardRequest.
 type V4Options struct {
 	Ports []int32
 }
 
-// newOptions creates a new options from the Request.
+// NewV4Options creates a new options from the Request.
 func NewV4Options(req *http.Request) (*V4Options, error) {
 	if !wsstream.IsWebSocketRequest(req) {
 		return &V4Options{}, nil
@@ -158,7 +158,6 @@ type websocketStreamPair struct {
 // request over a websocket connection
 type websocketStreamHandler struct {
 	conn        *wsstream.Conn
-	ports       []int32
 	streamPairs []*websocketStreamPair
 	pod         string
 	uid         types.UID
@@ -186,9 +185,9 @@ func (h *websocketStreamHandler) portForward(p *websocketStreamPair) {
 	defer p.dataStream.Close()
 	defer p.errorStream.Close()
 
-	glog.V(5).Infof("(conn=%p) invoking forwarder.PortForward for port %d", h.conn, p.port)
+	klog.V(5).Infof("(conn=%p) invoking forwarder.PortForward for port %d", h.conn, p.port)
 	err := h.forwarder.PortForward(h.pod, h.uid, p.port, p.dataStream)
-	glog.V(5).Infof("(conn=%p) done invoking forwarder.PortForward for port %d", h.conn, p.port)
+	klog.V(5).Infof("(conn=%p) done invoking forwarder.PortForward for port %d", h.conn, p.port)
 
 	if err != nil {
 		msg := fmt.Errorf("error forwarding port %d to pod %s, uid %v: %v", p.port, h.pod, h.uid, err)

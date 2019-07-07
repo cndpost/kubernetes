@@ -1,11 +1,4 @@
-package(default_visibility = ["//visibility:public"])
-
-licenses(["notice"])
-
-load(
-    "@io_bazel_rules_go//go:def.bzl",
-    "go_library",
-)
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "go_default_library",
@@ -27,7 +20,9 @@ go_library(
         "urlpick.go",
         "util.go",
     ],
-    tags = ["automanaged"],
+    importmap = "k8s.io/kubernetes/vendor/github.com/coreos/etcd/rafthttp",
+    importpath = "github.com/coreos/etcd/rafthttp",
+    visibility = ["//visibility:public"],
     deps = [
         "//vendor/github.com/coreos/etcd/etcdserver/stats:go_default_library",
         "//vendor/github.com/coreos/etcd/pkg/httputil:go_default_library",
@@ -44,7 +39,7 @@ go_library(
         "//vendor/github.com/coreos/pkg/capnslog:go_default_library",
         "//vendor/github.com/prometheus/client_golang/prometheus:go_default_library",
         "//vendor/github.com/xiang90/probing:go_default_library",
-        "//vendor/golang.org/x/net/context:go_default_library",
+        "//vendor/golang.org/x/time/rate:go_default_library",
     ],
 )
 
@@ -59,4 +54,5 @@ filegroup(
     name = "all-srcs",
     srcs = [":package-srcs"],
     tags = ["automanaged"],
+    visibility = ["//visibility:public"],
 )

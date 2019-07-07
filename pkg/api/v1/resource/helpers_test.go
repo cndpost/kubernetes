@@ -21,8 +21,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
+	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/kubernetes/pkg/api/v1"
 )
 
 func TestResourceHelpers(t *testing.T) {
@@ -30,9 +30,8 @@ func TestResourceHelpers(t *testing.T) {
 	memoryLimit := resource.MustParse("10G")
 	resourceSpec := v1.ResourceRequirements{
 		Limits: v1.ResourceList{
-			"cpu":             cpuLimit,
-			"memory":          memoryLimit,
-			"kube.io/storage": memoryLimit,
+			v1.ResourceCPU:    cpuLimit,
+			v1.ResourceMemory: memoryLimit,
 		},
 	}
 	if res := resourceSpec.Limits.Cpu(); res.Cmp(cpuLimit) != 0 {
@@ -43,8 +42,7 @@ func TestResourceHelpers(t *testing.T) {
 	}
 	resourceSpec = v1.ResourceRequirements{
 		Limits: v1.ResourceList{
-			"memory":          memoryLimit,
-			"kube.io/storage": memoryLimit,
+			v1.ResourceMemory: memoryLimit,
 		},
 	}
 	if res := resourceSpec.Limits.Cpu(); res.Value() != 0 {
@@ -62,6 +60,31 @@ func TestDefaultResourceHelpers(t *testing.T) {
 	}
 	if resourceList.Memory().Format != resource.BinarySI {
 		t.Errorf("expected %v, actual %v", resource.BinarySI, resourceList.Memory().Format)
+	}
+}
+
+func TestGetResourceRequest(t *testing.T) {
+	cases := []struct {
+		pod           *v1.Pod
+		res           v1.ResourceName
+		expectedValue int64
+		expectedError error
+	}{
+		{
+			pod:           getPod("foo", "9", "", "", ""),
+			res:           v1.ResourceCPU,
+			expectedValue: 9000,
+		},
+		{
+			pod:           getPod("foo", "", "", "90Mi", ""),
+			res:           v1.ResourceMemory,
+			expectedValue: 94371840,
+		},
+	}
+	as := assert.New(t)
+	for idx, tc := range cases {
+		actual := GetResourceRequest(tc.pod, tc.res)
+		as.Equal(actual, tc.expectedValue, "expected test case [%d] to return %q; got %q instead", idx, tc.expectedValue, actual)
 	}
 }
 
@@ -139,6 +162,72 @@ func TestExtractResourceValue(t *testing.T) {
 			pod:           getPod("foo", "", "", "10Mi", "100Mi"),
 			expectedValue: "104857600",
 		},
+		{
+			fs: &v1.ResourceFieldSelector{
+				Resource: "limits.cpu",
+			},
+			cName:         "init-foo",
+			pod:           getPod("foo", "", "9", "", ""),
+			expectedValue: "9",
+		},
+		{
+			fs: &v1.ResourceFieldSelector{
+				Resource: "requests.cpu",
+			},
+			cName:         "init-foo",
+			pod:           getPod("foo", "", "", "", ""),
+			expectedValue: "0",
+		},
+		{
+			fs: &v1.ResourceFieldSelector{
+				Resource: "requests.cpu",
+			},
+			cName:         "init-foo",
+			pod:           getPod("foo", "8", "", "", ""),
+			expectedValue: "8",
+		},
+		{
+			fs: &v1.ResourceFieldSelector{
+				Resource: "requests.cpu",
+			},
+			cName:         "init-foo",
+			pod:           getPod("foo", "100m", "", "", ""),
+			expectedValue: "1",
+		},
+		{
+			fs: &v1.ResourceFieldSelector{
+				Resource: "requests.cpu",
+				Divisor:  resource.MustParse("100m"),
+			},
+			cName:         "init-foo",
+			pod:           getPod("foo", "1200m", "", "", ""),
+			expectedValue: "12",
+		},
+		{
+			fs: &v1.ResourceFieldSelector{
+				Resource: "requests.memory",
+			},
+			cName:         "init-foo",
+			pod:           getPod("foo", "", "", "100Mi", ""),
+			expectedValue: "104857600",
+		},
+		{
+			fs: &v1.ResourceFieldSelector{
+				Resource: "requests.memory",
+				Divisor:  resource.MustParse("1Mi"),
+			},
+			cName:         "init-foo",
+			pod:           getPod("foo", "", "", "100Mi", "1Gi"),
+			expectedValue: "100",
+		},
+		{
+			fs: &v1.ResourceFieldSelector{
+				Resource: "limits.memory",
+			},
+			cName:         "init-foo",
+			pod:           getPod("foo", "", "", "10Mi", "100Mi"),
+			expectedValue: "104857600",
+		},
 	}
 	as := assert.New(t)
 	for idx, tc := range cases {
@@ -174,6 +263,12 @@ func getPod(cname, cpuRequest, cpuLimit, memoryRequest, memoryLimit string) *v1.
 			Containers: []v1.Container{
 				{
 					Name:      cname,
+					Resources: resources,
+				},
+			},
+			InitContainers: []v1.Container{
+				{
+					Name:      "init-" + cname,
 					Resources: resources,
 				},
 			},

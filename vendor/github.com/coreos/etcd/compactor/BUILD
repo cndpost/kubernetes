@@ -1,25 +1,21 @@
-package(default_visibility = ["//visibility:public"])
-
-licenses(["notice"])
-
-load(
-    "@io_bazel_rules_go//go:def.bzl",
-    "go_library",
-)
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "go_default_library",
     srcs = [
         "compactor.go",
         "doc.go",
+        "periodic.go",
+        "revision.go",
     ],
-    tags = ["automanaged"],
+    importmap = "k8s.io/kubernetes/vendor/github.com/coreos/etcd/compactor",
+    importpath = "github.com/coreos/etcd/compactor",
+    visibility = ["//visibility:public"],
     deps = [
         "//vendor/github.com/coreos/etcd/etcdserver/etcdserverpb:go_default_library",
         "//vendor/github.com/coreos/etcd/mvcc:go_default_library",
         "//vendor/github.com/coreos/pkg/capnslog:go_default_library",
         "//vendor/github.com/jonboulle/clockwork:go_default_library",
-        "//vendor/golang.org/x/net/context:go_default_library",
     ],
 )
 
@@ -34,4 +30,5 @@ filegroup(
     name = "all-srcs",
     srcs = [":package-srcs"],
     tags = ["automanaged"],
+    visibility = ["//visibility:public"],
 )

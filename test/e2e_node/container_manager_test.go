@@ -26,15 +26,18 @@ import (
 	"strings"
 	"time"
 
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/uuid"
-	"k8s.io/kubernetes/pkg/api/v1"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 	"k8s.io/kubernetes/test/e2e/framework"
+	e2elog "k8s.io/kubernetes/test/e2e/framework/log"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+	imageutils "k8s.io/kubernetes/test/utils/image"
 )
 
 func getOOMScoreForPid(pid int) (int, error) {
@@ -73,12 +76,12 @@ func validateOOMScoreAdjSettingIsInRange(pid int, expectedMinOOMScoreAdj, expect
 
 var _ = framework.KubeDescribe("Container Manager Misc [Serial]", func() {
 	f := framework.NewDefaultFramework("kubelet-container-manager")
-	Describe("Validate OOM score adjustments", func() {
+	Describe("Validate OOM score adjustments [NodeFeature:OOMScoreAdj]", func() {
 		Context("once the node is setup", func() {
-			It("docker daemon's oom-score-adj should be -999", func() {
-				dockerPids, err := getPidsForProcess(dockerProcessName, dockerPidFile)
-				Expect(err).To(BeNil(), "failed to get list of docker daemon pids")
-				for _, pid := range dockerPids {
+			It("container runtime's oom-score-adj should be -999", func() {
+				runtimePids, err := getPidsForProcess(framework.TestContext.ContainerRuntimeProcessName, framework.TestContext.ContainerRuntimePidFile)
+				Expect(err).To(BeNil(), "failed to get list of container runtime pids")
+				for _, pid := range runtimePids {
 					Eventually(func() error {
 						return validateOOMScoreAdjSetting(pid, -999)
 					}, 5*time.Minute, 30*time.Second).Should(BeNil())
@@ -147,14 +150,22 @@ var _ = framework.KubeDescribe("Container Manager Misc [Serial]", func() {
 						return validateOOMScoreAdjSetting(shPids[0], 1000)
 					}, 2*time.Minute, time.Second*4).Should(BeNil())
 				})
-				// Log the running containers here to help debugging. Use `docker ps`
-				// directly for now because the test is already docker specific.
+				// Log the running containers here to help debugging.
 				AfterEach(func() {
 					if CurrentGinkgoTestDescription().Failed {
-						By("Dump all running docker containers")
-						output, err := exec.Command("docker", "ps").CombinedOutput()
-						Expect(err).NotTo(HaveOccurred())
-						framework.Logf("Running docker containers:\n%s", string(output))
+						By("Dump all running containers")
+						runtime, _, err := getCRIClient()
+						framework.ExpectNoError(err)
+						containers, err := runtime.ListContainers(&runtimeapi.ContainerFilter{
+							State: &runtimeapi.ContainerStateValue{
+								State: runtimeapi.ContainerState_CONTAINER_RUNNING,
+							},
+						})
+						framework.ExpectNoError(err)
+						e2elog.Logf("Running containers:")
+						for _, c := range containers {
+							e2elog.Logf("%+v", c)
+						}
 					}
 				})
 			})
@@ -168,12 +179,12 @@ var _ = framework.KubeDescribe("Container Manager Misc [Serial]", func() {
 					Spec: v1.PodSpec{
 						Containers: []v1.Container{
 							{
-								Image: "gcr.io/google_containers/nginx-slim:0.7",
+								Image: imageutils.GetE2EImage(imageutils.Nginx),
 								Name:  podName,
 								Resources: v1.ResourceRequirements{
 									Limits: v1.ResourceList{
-										"cpu":    resource.MustParse("100m"),
-										"memory": resource.MustParse("50Mi"),
+										v1.ResourceCPU:    resource.MustParse("100m"),
+										v1.ResourceMemory: resource.MustParse("50Mi"),
 									},
 								},
 							},
@@ -209,12 +220,12 @@ var _ = framework.KubeDescribe("Container Manager Misc [Serial]", func() {
 					Spec: v1.PodSpec{
 						Containers: []v1.Container{
 							{
-								Image: "gcr.io/google_containers/test-webserver:e2e",
+								Image: imageutils.GetE2EImage(imageutils.TestWebserver),
 								Name:  podName,
 								Resources: v1.ResourceRequirements{
 									Requests: v1.ResourceList{
-										"cpu":    resource.MustParse("100m"),
-										"memory": resource.MustParse("50Mi"),
+										v1.ResourceCPU:    resource.MustParse("100m"),
+										v1.ResourceMemory: resource.MustParse("50Mi"),
 									},
 								},
 							},

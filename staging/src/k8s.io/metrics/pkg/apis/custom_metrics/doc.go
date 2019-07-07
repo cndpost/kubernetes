@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// +k8s:deepcopy-gen=package,register
-// +groupName=custom-metrics.metrics.k8s.io
-package custom_metrics
+// +k8s:deepcopy-gen=package
+// +groupName=custom.metrics.k8s.io
+
+// Package custom_metrics defines an API for using custom metrics.
+package custom_metrics // import "k8s.io/metrics/pkg/apis/custom_metrics"

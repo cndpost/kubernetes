@@ -1,11 +1,4 @@
-package(default_visibility = ["//visibility:public"])
-
-licenses(["notice"])
-
-load(
-    "@io_bazel_rules_go//go:def.bzl",
-    "go_library",
-)
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "go_default_library",
@@ -13,9 +6,11 @@ go_library(
         "apply.go",
         "apply_auth.go",
         "apply_v2.go",
+        "backend.go",
         "cluster_util.go",
         "config.go",
         "consistent_index.go",
+        "corrupt.go",
         "doc.go",
         "errors.go",
         "metrics.go",
@@ -28,14 +23,18 @@ go_library(
         "v2_server.go",
         "v3_server.go",
     ],
-    tags = ["automanaged"],
+    importmap = "k8s.io/kubernetes/vendor/github.com/coreos/etcd/etcdserver",
+    importpath = "github.com/coreos/etcd/etcdserver",
+    visibility = ["//visibility:public"],
     deps = [
         "//vendor/github.com/coreos/etcd/alarm:go_default_library",
         "//vendor/github.com/coreos/etcd/auth:go_default_library",
+        "//vendor/github.com/coreos/etcd/clientv3:go_default_library",
         "//vendor/github.com/coreos/etcd/compactor:go_default_library",
         "//vendor/github.com/coreos/etcd/discovery:go_default_library",
         "//vendor/github.com/coreos/etcd/etcdserver/api:go_default_library",
         "//vendor/github.com/coreos/etcd/etcdserver/api/v2http/httptypes:go_default_library",
+        "//vendor/github.com/coreos/etcd/etcdserver/api/v3rpc/rpctypes:go_default_library",
         "//vendor/github.com/coreos/etcd/etcdserver/etcdserverpb:go_default_library",
         "//vendor/github.com/coreos/etcd/etcdserver/membership:go_default_library",
         "//vendor/github.com/coreos/etcd/etcdserver/stats:go_default_library",
@@ -46,7 +45,6 @@ go_library(
         "//vendor/github.com/coreos/etcd/mvcc/mvccpb:go_default_library",
         "//vendor/github.com/coreos/etcd/pkg/contention:go_default_library",
         "//vendor/github.com/coreos/etcd/pkg/fileutil:go_default_library",
-        "//vendor/github.com/coreos/etcd/pkg/httputil:go_default_library",
         "//vendor/github.com/coreos/etcd/pkg/idutil:go_default_library",
         "//vendor/github.com/coreos/etcd/pkg/netutil:go_default_library",
         "//vendor/github.com/coreos/etcd/pkg/pbutil:go_default_library",
@@ -66,8 +64,8 @@ go_library(
         "//vendor/github.com/coreos/go-semver/semver:go_default_library",
         "//vendor/github.com/coreos/pkg/capnslog:go_default_library",
         "//vendor/github.com/gogo/protobuf/proto:go_default_library",
+        "//vendor/github.com/golang/protobuf/proto:go_default_library",
         "//vendor/github.com/prometheus/client_golang/prometheus:go_default_library",
-        "//vendor/golang.org/x/net/context:go_default_library",
     ],
 )
 
@@ -89,4 +87,5 @@ filegroup(
         "//vendor/github.com/coreos/etcd/etcdserver/stats:all-srcs",
     ],
     tags = ["automanaged"],
+    visibility = ["//visibility:public"],
 )

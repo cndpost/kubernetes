@@ -19,14 +19,14 @@ package ipconfig
 import (
 	"testing"
 
-	"k8s.io/kubernetes/pkg/util/exec"
+	"k8s.io/utils/exec"
 )
 
-func TestGetDnsSuffixSearchList(t *testing.T) {
+func TestGetDNSSuffixSearchList(t *testing.T) {
 	// Simple test
 	ipconfigInterface := New(exec.New())
 
-	_, err := ipconfigInterface.GetDnsSuffixSearchList()
+	_, err := ipconfigInterface.GetDNSSuffixSearchList()
 	if err != nil {
 		t.Errorf("expected success, got %v", err)
 	}

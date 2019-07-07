@@ -17,21 +17,18 @@ limitations under the License.
 package request
 
 import (
+	"fmt"
 	"net/http"
 	"reflect"
+	"strings"
 	"testing"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 )
 
-type fakeRL bool
-
-func (fakeRL) Stop()             {}
-func (f fakeRL) TryAccept() bool { return bool(f) }
-func (f fakeRL) Accept()         {}
-
 func TestGetAPIRequestInfo(t *testing.T) {
-	namespaceAll := "" // TODO(sttts): solve import cycle when using metav1.NamespaceAll
+	namespaceAll := metav1.NamespaceAll
 	successCases := []struct {
 		method              string
 		url                 string
@@ -61,8 +58,6 @@ func TestGetAPIRequestInfo(t *testing.T) {
 		// special verbs
 		{"GET", "/api/v1/proxy/namespaces/other/pods/foo", "proxy", "api", "", "v1", "other", "pods", "", "foo", []string{"pods", "foo"}},
 		{"GET", "/api/v1/proxy/namespaces/other/pods/foo/subpath/not/a/subresource", "proxy", "api", "", "v1", "other", "pods", "", "foo", []string{"pods", "foo", "subpath", "not", "a", "subresource"}},
-		{"GET", "/api/v1/redirect/namespaces/other/pods/foo", "redirect", "api", "", "v1", "other", "pods", "", "foo", []string{"pods", "foo"}},
-		{"GET", "/api/v1/redirect/namespaces/other/pods/foo/subpath/not/a/subresource", "redirect", "api", "", "v1", "other", "pods", "", "foo", []string{"pods", "foo", "subpath", "not", "a", "subresource"}},
 		{"GET", "/api/v1/watch/pods", "watch", "api", "", "v1", namespaceAll, "pods", "", "", []string{"pods"}},
 		{"GET", "/api/v1/pods?watch=true", "watch", "api", "", "v1", namespaceAll, "pods", "", "", []string{"pods"}},
 		{"GET", "/api/v1/pods?watch=false", "list", "api", "", "v1", namespaceAll, "pods", "", "", []string{"pods"}},
@@ -192,5 +187,79 @@ func newTestRequestInfoResolver() *RequestInfoFactory {
 	return &RequestInfoFactory{
 		APIPrefixes:          sets.NewString("api", "apis"),
 		GrouplessAPIPrefixes: sets.NewString("api"),
+	}
+}
+
+func TestFieldSelectorParsing(t *testing.T) {
+	tests := []struct {
+		name         string
+		url          string
+		expectedName string
+		expectedErr  error
+		expectedVerb string
+	}{
+		{
+			name:         "no selector",
+			url:          "/apis/group/version/resource",
+			expectedVerb: "list",
+		},
+		{
+			name:         "metadata.name selector",
+			url:          "/apis/group/version/resource?fieldSelector=metadata.name=name1",
+			expectedName: "name1",
+			expectedVerb: "list",
+		},
+		{
+			name:         "metadata.name selector with watch",
+			url:          "/apis/group/version/resource?watch=true&fieldSelector=metadata.name=name1",
+			expectedName: "name1",
+			expectedVerb: "watch",
+		},
+		{
+			name:         "random selector",
+			url:          "/apis/group/version/resource?fieldSelector=foo=bar",
+			expectedName: "",
+			expectedVerb: "list",
+		},
+		{
+			name:         "invalid selector with metadata.name",
+			url:          "/apis/group/version/resource?fieldSelector=metadata.name=name1,foo",
+			expectedName: "",
+			expectedErr:  fmt.Errorf("invalid selector"),
+			expectedVerb: "list",
+		},
+		{
+			name:         "invalid selector with metadata.name with watch",
+			url:          "/apis/group/version/resource?fieldSelector=metadata.name=name1,foo&watch=true",
+			expectedName: "",
+			expectedErr:  fmt.Errorf("invalid selector"),
+			expectedVerb: "watch",
+		},
+		{
+			name:         "invalid selector with metadata.name with watch false",
+			url:          "/apis/group/version/resource?fieldSelector=metadata.name=name1,foo&watch=false",
+			expectedName: "",
+			expectedErr:  fmt.Errorf("invalid selector"),
+			expectedVerb: "list",
+		},
+	}
+
+	resolver := newTestRequestInfoResolver()
+
+	for _, tc := range tests {
+		req, _ := http.NewRequest("GET", tc.url, nil)
+
+		apiRequestInfo, err := resolver.NewRequestInfo(req)
+		if err != nil {
+			if tc.expectedErr == nil || !strings.Contains(err.Error(), tc.expectedErr.Error()) {
+				t.Errorf("%s: Unexpected error %v", tc.name, err)
+			}
+		}
+		if e, a := tc.expectedName, apiRequestInfo.Name; e != a {
+			t.Errorf("%s: expected %v, actual %v", tc.name, e, a)
+		}
+		if e, a := tc.expectedVerb, apiRequestInfo.Verb; e != a {
+			t.Errorf("%s: expected verb %v, actual %v", tc.name, e, a)
+		}
 	}
 }

@@ -1,11 +1,4 @@
-package(default_visibility = ["//visibility:public"])
-
-licenses(["notice"])
-
-load(
-    "@io_bazel_rules_go//go:def.bzl",
-    "go_library",
-)
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "go_default_library",
@@ -13,25 +6,26 @@ go_library(
         "afero.go",
         "basepath.go",
         "cacheOnReadFs.go",
+        "const_bsds.go",
         "const_win_unix.go",
         "copyOnWriteFs.go",
         "httpFs.go",
         "ioutil.go",
+        "lstater.go",
+        "match.go",
         "memmap.go",
-        "memradix.go",
         "os.go",
         "path.go",
         "readonlyfs.go",
         "regexpfs.go",
-        "sftp.go",
         "unionFile.go",
         "util.go",
     ],
-    tags = ["automanaged"],
+    importmap = "k8s.io/kubernetes/vendor/github.com/spf13/afero",
+    importpath = "github.com/spf13/afero",
+    visibility = ["//visibility:public"],
     deps = [
-        "//vendor/github.com/pkg/sftp:go_default_library",
         "//vendor/github.com/spf13/afero/mem:go_default_library",
-        "//vendor/github.com/spf13/afero/sftp:go_default_library",
         "//vendor/golang.org/x/text/transform:go_default_library",
         "//vendor/golang.org/x/text/unicode/norm:go_default_library",
     ],
@@ -49,7 +43,7 @@ filegroup(
     srcs = [
         ":package-srcs",
         "//vendor/github.com/spf13/afero/mem:all-srcs",
-        "//vendor/github.com/spf13/afero/sftp:all-srcs",
     ],
     tags = ["automanaged"],
+    visibility = ["//visibility:public"],
 )

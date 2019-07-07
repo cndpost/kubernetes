@@ -26,20 +26,18 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"k8s.io/apimachinery/pkg/apimachinery/announced"
-	"k8s.io/apimachinery/pkg/apimachinery/registered"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apiserver/pkg/endpoints/request"
 )
 
 var (
-	groupFactoryRegistry = make(announced.APIGroupFactoryRegistry)
-	registry             = registered.NewOrDie("")
-	scheme               = runtime.NewScheme()
-	codecs               = serializer.NewCodecFactory(scheme)
+	scheme = runtime.NewScheme()
+	codecs = serializer.NewCodecFactory(scheme)
 )
 
 func init() {
@@ -82,10 +80,27 @@ func getGroupList(t *testing.T, server *httptest.Server) (*metav1.APIGroupList, 
 	return &groupList, err
 }
 
+func contextHandler(handler http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		ctx := req.Context()
+		resolver := &request.RequestInfoFactory{
+			APIPrefixes:          sets.NewString("api", "apis"),
+			GrouplessAPIPrefixes: sets.NewString("api"),
+		}
+		info, err := resolver.NewRequestInfo(req)
+		if err == nil {
+			ctx = request.WithRequestInfo(ctx, info)
+		}
+		req = req.WithContext(ctx)
+		handler.ServeHTTP(w, req)
+	})
+}
+
 func TestDiscoveryAtAPIS(t *testing.T) {
 	handler := NewRootAPIsHandler(DefaultAddresses{DefaultAddress: "192.168.1.1"}, codecs)
 
-	server := httptest.NewServer(handler)
+	server := httptest.NewServer(contextHandler(handler))
+
 	groupList, err := getGroupList(t, server)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

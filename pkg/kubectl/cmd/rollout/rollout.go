@@ -17,45 +17,51 @@ limitations under the License.
 package rollout
 
 import (
-	"io"
-
-	"github.com/renstrom/dedent"
+	"github.com/lithammer/dedent"
 	"github.com/spf13/cobra"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/templates"
+	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"k8s.io/kubectl/pkg/util/templates"
 	cmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
-	"k8s.io/kubernetes/pkg/util/i18n"
+	"k8s.io/kubernetes/pkg/kubectl/util/i18n"
 )
 
 var (
-	rollout_long = templates.LongDesc(`
-		Manage a deployment using subcommands like "kubectl rollout undo deployment/abc"`)
+	rolloutLong = templates.LongDesc(`
+		Manage the rollout of a resource.` + rolloutValidResources)
 
-	rollout_example = templates.Examples(`
+	rolloutExample = templates.Examples(`
 		# Rollback to the previous deployment
-		kubectl rollout undo deployment/abc`)
+		kubectl rollout undo deployment/abc
 
-	rollout_valid_resources = dedent.Dedent(`
+		# Check the rollout status of a daemonset
+		kubectl rollout status daemonset/foo`)
+
+	rolloutValidResources = dedent.Dedent(`
 		Valid resource types include:
+
 		   * deployments
+		   * daemonsets
+		   * statefulsets
 		`)
 )
 
-func NewCmdRollout(f cmdutil.Factory, out, errOut io.Writer) *cobra.Command {
-
+// NewCmdRollout returns a Command instance for 'rollout' sub command
+func NewCmdRollout(f cmdutil.Factory, streams genericclioptions.IOStreams) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:     "rollout SUBCOMMAND",
-		Short:   i18n.T("Manage a deployment rollout"),
-		Long:    rollout_long,
-		Example: rollout_example,
-		Run:     cmdutil.DefaultSubCommandRun(errOut),
+		Use:                   "rollout SUBCOMMAND",
+		DisableFlagsInUseLine: true,
+		Short:                 i18n.T("Manage the rollout of a resource"),
+		Long:                  rolloutLong,
+		Example:               rolloutExample,
+		Run:                   cmdutil.DefaultSubCommandRun(streams.Out),
 	}
 	// subcommands
-	cmd.AddCommand(NewCmdRolloutHistory(f, out))
-	cmd.AddCommand(NewCmdRolloutPause(f, out))
-	cmd.AddCommand(NewCmdRolloutResume(f, out))
-	cmd.AddCommand(NewCmdRolloutUndo(f, out))
-
-	cmd.AddCommand(NewCmdRolloutStatus(f, out))
+	cmd.AddCommand(NewCmdRolloutHistory(f, streams))
+	cmd.AddCommand(NewCmdRolloutPause(f, streams))
+	cmd.AddCommand(NewCmdRolloutResume(f, streams))
+	cmd.AddCommand(NewCmdRolloutUndo(f, streams))
+	cmd.AddCommand(NewCmdRolloutStatus(f, streams))
+	cmd.AddCommand(NewCmdRolloutRestart(f, streams))
 
 	return cmd
 }

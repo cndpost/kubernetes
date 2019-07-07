@@ -1,11 +1,4 @@
-package(default_visibility = ["//visibility:public"])
-
-licenses(["notice"])
-
-load(
-    "@io_bazel_rules_go//go:def.bzl",
-    "go_library",
-)
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "go_default_library",
@@ -13,11 +6,12 @@ go_library(
         "doc.go",
         "lessor.go",
     ],
-    tags = ["automanaged"],
+    importmap = "k8s.io/kubernetes/vendor/github.com/coreos/etcd/lease",
+    importpath = "github.com/coreos/etcd/lease",
+    visibility = ["//visibility:public"],
     deps = [
         "//vendor/github.com/coreos/etcd/lease/leasepb:go_default_library",
         "//vendor/github.com/coreos/etcd/mvcc/backend:go_default_library",
-        "//vendor/github.com/coreos/etcd/pkg/monotime:go_default_library",
     ],
 )
 
@@ -36,4 +30,5 @@ filegroup(
         "//vendor/github.com/coreos/etcd/lease/leasepb:all-srcs",
     ],
     tags = ["automanaged"],
+    visibility = ["//visibility:public"],
 )

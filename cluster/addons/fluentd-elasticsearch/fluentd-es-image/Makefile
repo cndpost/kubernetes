@@ -1,4 +1,4 @@
-# Copyright 2016 The Kubernetes Authors.
+# Copyright 2017 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,12 +14,14 @@
 
 .PHONY:	build push
 
-PREFIX = gcr.io/google_containers
-IMAGE = fluentd-elasticsearch
-TAG = 1.22
+PREFIX = quay.io/fluentd_elasticsearch
+IMAGE = fluentd
+TAG = v2.5.2
 
 build:
-	docker build --pull -t $(PREFIX)/$(IMAGE):$(TAG) .
+	docker build  --tag ${PREFIX}/${IMAGE}:${TAG} .
 
 push:
-	gcloud docker --server=gcr.io -- push $(PREFIX)/$(IMAGE):$(TAG)
+	docker push ${PREFIX}/${IMAGE}:${TAG}
+	docker push ${PREFIX}/${IMAGE}:latest
+	

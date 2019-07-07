@@ -1,11 +1,4 @@
-package(default_visibility = ["//visibility:public"])
-
-licenses(["notice"])
-
-load(
-    "@io_bazel_rules_go//go:def.bzl",
-    "go_library",
-)
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "go_default_library",
@@ -15,7 +8,9 @@ go_library(
         "lex.go",
         "parse.go",
     ],
-    tags = ["automanaged"],
+    importmap = "k8s.io/kubernetes/vendor/github.com/hashicorp/hcl",
+    importpath = "github.com/hashicorp/hcl",
+    visibility = ["//visibility:public"],
     deps = [
         "//vendor/github.com/hashicorp/hcl/hcl/ast:go_default_library",
         "//vendor/github.com/hashicorp/hcl/hcl/parser:go_default_library",
@@ -37,6 +32,7 @@ filegroup(
         ":package-srcs",
         "//vendor/github.com/hashicorp/hcl/hcl/ast:all-srcs",
         "//vendor/github.com/hashicorp/hcl/hcl/parser:all-srcs",
+        "//vendor/github.com/hashicorp/hcl/hcl/printer:all-srcs",
         "//vendor/github.com/hashicorp/hcl/hcl/scanner:all-srcs",
         "//vendor/github.com/hashicorp/hcl/hcl/strconv:all-srcs",
         "//vendor/github.com/hashicorp/hcl/hcl/token:all-srcs",
@@ -45,4 +41,5 @@ filegroup(
         "//vendor/github.com/hashicorp/hcl/json/token:all-srcs",
     ],
     tags = ["automanaged"],
+    visibility = ["//visibility:public"],
 )

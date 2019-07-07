@@ -50,9 +50,15 @@ func ValidateSelfSubjectAccessReviewSpec(spec authorizationapi.SelfSubjectAccess
 	return allErrs
 }
 
+func ValidateSelfSubjectRulesReview(review *authorizationapi.SelfSubjectRulesReview) field.ErrorList {
+	return field.ErrorList{}
+}
+
 func ValidateSubjectAccessReview(sar *authorizationapi.SubjectAccessReview) field.ErrorList {
 	allErrs := ValidateSubjectAccessReviewSpec(sar.Spec, field.NewPath("spec"))
-	if !apiequality.Semantic.DeepEqual(metav1.ObjectMeta{}, sar.ObjectMeta) {
+	objectMetaShallowCopy := sar.ObjectMeta
+	objectMetaShallowCopy.ManagedFields = nil
+	if !apiequality.Semantic.DeepEqual(metav1.ObjectMeta{}, objectMetaShallowCopy) {
 		allErrs = append(allErrs, field.Invalid(field.NewPath("metadata"), sar.ObjectMeta, `must be empty`))
 	}
 	return allErrs
@@ -60,7 +66,9 @@ func ValidateSubjectAccessReview(sar *authorizationapi.SubjectAccessReview) fiel
 
 func ValidateSelfSubjectAccessReview(sar *authorizationapi.SelfSubjectAccessReview) field.ErrorList {
 	allErrs := ValidateSelfSubjectAccessReviewSpec(sar.Spec, field.NewPath("spec"))
-	if !apiequality.Semantic.DeepEqual(metav1.ObjectMeta{}, sar.ObjectMeta) {
+	objectMetaShallowCopy := sar.ObjectMeta
+	objectMetaShallowCopy.ManagedFields = nil
+	if !apiequality.Semantic.DeepEqual(metav1.ObjectMeta{}, objectMetaShallowCopy) {
 		allErrs = append(allErrs, field.Invalid(field.NewPath("metadata"), sar.ObjectMeta, `must be empty`))
 	}
 	return allErrs
@@ -71,6 +79,7 @@ func ValidateLocalSubjectAccessReview(sar *authorizationapi.LocalSubjectAccessRe
 
 	objectMetaShallowCopy := sar.ObjectMeta
 	objectMetaShallowCopy.Namespace = ""
+	objectMetaShallowCopy.ManagedFields = nil
 	if !apiequality.Semantic.DeepEqual(metav1.ObjectMeta{}, objectMetaShallowCopy) {
 		allErrs = append(allErrs, field.Invalid(field.NewPath("metadata"), sar.ObjectMeta, `must be empty except for namespace`))
 	}

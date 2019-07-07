@@ -1,16 +1,15 @@
-package(default_visibility = ["//visibility:public"])
-
-licenses(["notice"])
-
-load(
-    "@io_bazel_rules_go//go:def.bzl",
-    "go_library",
-)
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "go_default_library",
-    srcs = ["thatswhyyoualwaysleaveanote.go"],
-    tags = ["automanaged"],
+    srcs = [
+        "default_notepad.go",
+        "log_counter.go",
+        "notepad.go",
+    ],
+    importmap = "k8s.io/kubernetes/vendor/github.com/spf13/jwalterweatherman",
+    importpath = "github.com/spf13/jwalterweatherman",
+    visibility = ["//visibility:public"],
 )
 
 filegroup(
@@ -24,4 +23,5 @@ filegroup(
     name = "all-srcs",
     srcs = [":package-srcs"],
     tags = ["automanaged"],
+    visibility = ["//visibility:public"],
 )

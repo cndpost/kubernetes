@@ -1,7 +1,5 @@
 package(default_visibility = ["//visibility:public"])
 
-licenses(["notice"])
-
 load(
     "@io_bazel_rules_go//go:def.bzl",
     "go_library",
@@ -10,15 +8,11 @@ load(
 go_library(
     name = "go_default_library",
     srcs = ["insecure_handler.go"],
-    tags = ["automanaged"],
+    importpath = "k8s.io/kubernetes/pkg/kubeapiserver/server",
     deps = [
-        "//vendor/github.com/golang/glog:go_default_library",
-        "//vendor/k8s.io/apiserver/pkg/authentication/user:go_default_library",
-        "//vendor/k8s.io/apiserver/pkg/endpoints/filters:go_default_library",
-        "//vendor/k8s.io/apiserver/pkg/endpoints/request:go_default_library",
-        "//vendor/k8s.io/apiserver/pkg/server:go_default_library",
-        "//vendor/k8s.io/apiserver/pkg/server/filters:go_default_library",
-        "//vendor/k8s.io/client-go/rest:go_default_library",
+        "//staging/src/k8s.io/apiserver/pkg/endpoints/filters:go_default_library",
+        "//staging/src/k8s.io/apiserver/pkg/server:go_default_library",
+        "//staging/src/k8s.io/apiserver/pkg/server/filters:go_default_library",
     ],
 )
 

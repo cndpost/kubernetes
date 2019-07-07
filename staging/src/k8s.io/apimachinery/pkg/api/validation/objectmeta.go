@@ -30,10 +30,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 )
 
-// TODO: delete this global variable when we enable the validation of common
-// fields by default.
-var RepairMalformedUpdates bool = true
-
 const FieldImmutableErrorMsg string = `field is immutable`
 
 const totalAnnotationSizeLimitB int = 256 * (1 << 10) // 256 kB
@@ -180,6 +176,9 @@ func ValidateObjectMetaAccessor(meta metav1.Object, requiresNamespace bool, name
 			allErrs = append(allErrs, field.Invalid(fldPath.Child("clusterName"), meta.GetClusterName(), msg))
 		}
 	}
+	for _, entry := range meta.GetManagedFields() {
+		allErrs = append(allErrs, v1validation.ValidateFieldManager(entry.Manager, fldPath.Child("fieldManager"))...)
+	}
 	allErrs = append(allErrs, ValidateNonnegativeField(meta.GetGeneration(), fldPath.Child("generation"))...)
 	allErrs = append(allErrs, v1validation.ValidateLabels(meta.GetLabels(), fldPath.Child("labels"))...)
 	allErrs = append(allErrs, ValidateAnnotations(meta.GetAnnotations(), fldPath.Child("annotations"))...)
@@ -226,40 +225,7 @@ func ValidateObjectMetaUpdate(newMeta, oldMeta *metav1.ObjectMeta, fldPath *fiel
 }
 
 func ValidateObjectMetaAccessorUpdate(newMeta, oldMeta metav1.Object, fldPath *field.Path) field.ErrorList {
-	allErrs := field.ErrorList{}
-
-	if !RepairMalformedUpdates && newMeta.GetUID() != oldMeta.GetUID() {
-		allErrs = append(allErrs, field.Invalid(fldPath.Child("uid"), newMeta.GetUID(), "field is immutable"))
-	}
-	// in the event it is left empty, set it, to allow clients more flexibility
-	// TODO: remove the following code that repairs the update request when we retire the clients that modify the immutable fields.
-	// Please do not copy this pattern elsewhere; validation functions should not be modifying the objects they are passed!
-	if RepairMalformedUpdates {
-		if len(newMeta.GetUID()) == 0 {
-			newMeta.SetUID(oldMeta.GetUID())
-		}
-		// ignore changes to timestamp
-		if oldCreationTime := oldMeta.GetCreationTimestamp(); oldCreationTime.IsZero() {
-			oldMeta.SetCreationTimestamp(newMeta.GetCreationTimestamp())
-		} else {
-			newMeta.SetCreationTimestamp(oldMeta.GetCreationTimestamp())
-		}
-		// an object can never remove a deletion timestamp or clear/change grace period seconds
-		if !oldMeta.GetDeletionTimestamp().IsZero() {
-			newMeta.SetDeletionTimestamp(oldMeta.GetDeletionTimestamp())
-		}
-		if oldMeta.GetDeletionGracePeriodSeconds() != nil && newMeta.GetDeletionGracePeriodSeconds() == nil {
-			newMeta.SetDeletionGracePeriodSeconds(oldMeta.GetDeletionGracePeriodSeconds())
-		}
-	}
-
-	// TODO: needs to check if newMeta==nil && oldMeta !=nil after the repair logic is removed.
-	if newMeta.GetDeletionGracePeriodSeconds() != nil && (oldMeta.GetDeletionGracePeriodSeconds() == nil || *newMeta.GetDeletionGracePeriodSeconds() != *oldMeta.GetDeletionGracePeriodSeconds()) {
-		allErrs = append(allErrs, field.Invalid(fldPath.Child("deletionGracePeriodSeconds"), newMeta.GetDeletionGracePeriodSeconds(), "field is immutable; may only be changed via deletion"))
-	}
-	if newMeta.GetDeletionTimestamp() != nil && (oldMeta.GetDeletionTimestamp() == nil || !newMeta.GetDeletionTimestamp().Equal(*oldMeta.GetDeletionTimestamp())) {
-		allErrs = append(allErrs, field.Invalid(fldPath.Child("deletionTimestamp"), newMeta.GetDeletionTimestamp(), "field is immutable; may only be changed via deletion"))
-	}
+	var allErrs field.ErrorList
 
 	// Finalizers cannot be added if the object is already being deleted.
 	if oldMeta.GetDeletionTimestamp() != nil {
@@ -276,10 +242,15 @@ func ValidateObjectMetaAccessorUpdate(newMeta, oldMeta metav1.Object, fldPath *f
 		allErrs = append(allErrs, field.Invalid(fldPath.Child("generation"), newMeta.GetGeneration(), "must not be decremented"))
 	}
 
+	for _, entry := range newMeta.GetManagedFields() {
+		allErrs = append(allErrs, v1validation.ValidateFieldManager(entry.Manager, fldPath.Child("fieldManager"))...)
+	}
 	allErrs = append(allErrs, ValidateImmutableField(newMeta.GetName(), oldMeta.GetName(), fldPath.Child("name"))...)
 	allErrs = append(allErrs, ValidateImmutableField(newMeta.GetNamespace(), oldMeta.GetNamespace(), fldPath.Child("namespace"))...)
 	allErrs = append(allErrs, ValidateImmutableField(newMeta.GetUID(), oldMeta.GetUID(), fldPath.Child("uid"))...)
 	allErrs = append(allErrs, ValidateImmutableField(newMeta.GetCreationTimestamp(), oldMeta.GetCreationTimestamp(), fldPath.Child("creationTimestamp"))...)
+	allErrs = append(allErrs, ValidateImmutableField(newMeta.GetDeletionTimestamp(), oldMeta.GetDeletionTimestamp(), fldPath.Child("deletionTimestamp"))...)
+	allErrs = append(allErrs, ValidateImmutableField(newMeta.GetDeletionGracePeriodSeconds(), oldMeta.GetDeletionGracePeriodSeconds(), fldPath.Child("deletionGracePeriodSeconds"))...)
 	allErrs = append(allErrs, ValidateImmutableField(newMeta.GetClusterName(), oldMeta.GetClusterName(), fldPath.Child("clusterName"))...)
 
 	allErrs = append(allErrs, v1validation.ValidateLabels(newMeta.GetLabels(), fldPath.Child("labels"))...)

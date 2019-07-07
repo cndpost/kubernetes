@@ -1,7 +1,5 @@
 package(default_visibility = ["//visibility:public"])
 
-licenses(["notice"])
-
 load(
     "@io_bazel_rules_go//go:def.bzl",
     "go_library",
@@ -10,6 +8,7 @@ load(
 go_library(
     name = "go_default_library",
     srcs = [
+        "cadvisor_e2e.go",
         "node_conformance.go",
         "node_e2e.go",
         "remote.go",
@@ -17,11 +16,13 @@ go_library(
         "types.go",
         "utils.go",
     ],
-    tags = ["automanaged"],
+    importpath = "k8s.io/kubernetes/test/e2e_node/remote",
     deps = [
+        "//staging/src/k8s.io/apimachinery/pkg/util/errors:go_default_library",
         "//test/e2e_node/builder:go_default_library",
-        "//vendor/github.com/golang/glog:go_default_library",
-        "//vendor/k8s.io/apimachinery/pkg/util/errors:go_default_library",
+        "//test/e2e_node/system:go_default_library",
+        "//test/utils:go_default_library",
+        "//vendor/k8s.io/klog:go_default_library",
     ],
 )
 

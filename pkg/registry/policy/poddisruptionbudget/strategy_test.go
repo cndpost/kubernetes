@@ -35,10 +35,11 @@ func TestPodDisruptionBudgetStrategy(t *testing.T) {
 	}
 
 	validSelector := map[string]string{"a": "b"}
+	minAvailable := intstr.FromInt(3)
 	pdb := &policy.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{Name: "abc", Namespace: metav1.NamespaceDefault},
 		Spec: policy.PodDisruptionBudgetSpec{
-			MinAvailable: intstr.FromInt(3),
+			MinAvailable: &minAvailable,
 			Selector:     &metav1.LabelSelector{MatchLabels: validSelector},
 		},
 	}
@@ -67,21 +68,32 @@ func TestPodDisruptionBudgetStrategy(t *testing.T) {
 		t.Errorf("Unexpected error updating PodDisruptionBudget.")
 	}
 
-	// Changing the selector?  No.
+	// Changing the selector?  OK
 	newPdb.Spec.Selector = &metav1.LabelSelector{MatchLabels: map[string]string{"a": "bar"}}
 	Strategy.PrepareForUpdate(ctx, newPdb, pdb)
 	errs = Strategy.ValidateUpdate(ctx, newPdb, pdb)
-	if len(errs) == 0 {
-		t.Errorf("Expected a validation error since updates are disallowed on poddisruptionbudgets.")
+	if len(errs) != 0 {
+		t.Errorf("Expected no error on changing selector on poddisruptionbudgets.")
 	}
 	newPdb.Spec.Selector = pdb.Spec.Selector
 
-	// Changing MinAvailable?  Also no.
-	newPdb.Spec.MinAvailable = intstr.FromString("28%")
+	// Changing MinAvailable?  OK
+	newMinAvailable := intstr.FromString("28%")
+	newPdb.Spec.MinAvailable = &newMinAvailable
 	Strategy.PrepareForUpdate(ctx, newPdb, pdb)
 	errs = Strategy.ValidateUpdate(ctx, newPdb, pdb)
-	if len(errs) == 0 {
-		t.Errorf("Expected a validation error since updates are disallowed on poddisruptionbudgets.")
+	if len(errs) != 0 {
+		t.Errorf("Expected no error updating MinAvailable on poddisruptionbudgets.")
+	}
+
+	// Changing MinAvailable to MaxAvailable? OK
+	maxUnavailable := intstr.FromString("28%")
+	newPdb.Spec.MaxUnavailable = &maxUnavailable
+	newPdb.Spec.MinAvailable = nil
+	Strategy.PrepareForUpdate(ctx, newPdb, pdb)
+	errs = Strategy.ValidateUpdate(ctx, newPdb, pdb)
+	if len(errs) != 0 {
+		t.Errorf("Expected no error updating replacing MinAvailable with MaxUnavailable on poddisruptionbudgets.")
 	}
 }
 
@@ -93,12 +105,16 @@ func TestPodDisruptionBudgetStatusStrategy(t *testing.T) {
 	if StatusStrategy.AllowCreateOnUpdate() {
 		t.Errorf("PodDisruptionBudgetStatus should not allow create on update")
 	}
+
+	oldMinAvailable := intstr.FromInt(3)
+	newMinAvailable := intstr.FromInt(2)
+
 	validSelector := map[string]string{"a": "b"}
 	oldPdb := &policy.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{Name: "abc", Namespace: metav1.NamespaceDefault, ResourceVersion: "10"},
 		Spec: policy.PodDisruptionBudgetSpec{
 			Selector:     &metav1.LabelSelector{MatchLabels: validSelector},
-			MinAvailable: intstr.FromInt(3),
+			MinAvailable: &oldMinAvailable,
 		},
 		Status: policy.PodDisruptionBudgetStatus{
 			PodDisruptionsAllowed: 1,
@@ -111,7 +127,7 @@ func TestPodDisruptionBudgetStatusStrategy(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "abc", Namespace: metav1.NamespaceDefault, ResourceVersion: "9"},
 		Spec: policy.PodDisruptionBudgetSpec{
 			Selector:     &metav1.LabelSelector{MatchLabels: validSelector},
-			MinAvailable: intstr.FromInt(2),
+			MinAvailable: &newMinAvailable,
 		},
 		Status: policy.PodDisruptionBudgetStatus{
 			PodDisruptionsAllowed: 0,

@@ -1,16 +1,11 @@
-package(default_visibility = ["//visibility:public"])
-
-licenses(["notice"])
-
-load(
-    "@io_bazel_rules_go//go:def.bzl",
-    "go_library",
-)
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "go_default_library",
     srcs = ["difflib.go"],
-    tags = ["automanaged"],
+    importmap = "k8s.io/kubernetes/vendor/github.com/pmezard/go-difflib/difflib",
+    importpath = "github.com/pmezard/go-difflib/difflib",
+    visibility = ["//visibility:public"],
 )
 
 filegroup(
@@ -24,4 +19,5 @@ filegroup(
     name = "all-srcs",
     srcs = [":package-srcs"],
     tags = ["automanaged"],
+    visibility = ["//visibility:public"],
 )

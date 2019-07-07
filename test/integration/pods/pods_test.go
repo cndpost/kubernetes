@@ -20,23 +20,23 @@ import (
 	"fmt"
 	"testing"
 
+	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	clientset "k8s.io/client-go/kubernetes"
 	restclient "k8s.io/client-go/rest"
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/v1"
-	"k8s.io/kubernetes/pkg/client/clientset_generated/clientset"
 	"k8s.io/kubernetes/test/integration"
 	"k8s.io/kubernetes/test/integration/framework"
 )
 
 func TestPodUpdateActiveDeadlineSeconds(t *testing.T) {
-	_, s := framework.RunAMaster(nil)
-	defer s.Close()
+	_, s, closeFn := framework.RunAMaster(nil)
+	defer closeFn()
 
 	ns := framework.CreateTestingNamespace("pod-activedeadline-update", s, t)
 	defer framework.DeleteTestingNamespace(ns, s, t)
 
-	client := clientset.NewForConfigOrDie(&restclient.Config{Host: s.URL, ContentConfig: restclient.ContentConfig{GroupVersion: &api.Registry.GroupOrDie(v1.GroupName).GroupVersion}})
+	client := clientset.NewForConfigOrDie(&restclient.Config{Host: s.URL, ContentConfig: restclient.ContentConfig{GroupVersion: &schema.GroupVersion{Group: "", Version: "v1"}}})
 
 	var (
 		iZero = int64(0)
@@ -129,13 +129,13 @@ func TestPodUpdateActiveDeadlineSeconds(t *testing.T) {
 		pod.Spec.ActiveDeadlineSeconds = tc.original
 		pod.ObjectMeta.Name = fmt.Sprintf("activedeadlineseconds-test-%v", i)
 
-		if _, err := client.Core().Pods(ns.Name).Create(pod); err != nil {
+		if _, err := client.CoreV1().Pods(ns.Name).Create(pod); err != nil {
 			t.Errorf("Failed to create pod: %v", err)
 		}
 
 		pod.Spec.ActiveDeadlineSeconds = tc.update
 
-		_, err := client.Core().Pods(ns.Name).Update(pod)
+		_, err := client.CoreV1().Pods(ns.Name).Update(pod)
 		if tc.valid && err != nil {
 			t.Errorf("%v: failed to update pod: %v", tc.name, err)
 		} else if !tc.valid && err == nil {
@@ -147,14 +147,14 @@ func TestPodUpdateActiveDeadlineSeconds(t *testing.T) {
 }
 
 func TestPodReadOnlyFilesystem(t *testing.T) {
-	_, s := framework.RunAMaster(nil)
-	defer s.Close()
+	_, s, closeFn := framework.RunAMaster(nil)
+	defer closeFn()
 
 	isReadOnly := true
 	ns := framework.CreateTestingNamespace("pod-readonly-root", s, t)
 	defer framework.DeleteTestingNamespace(ns, s, t)
 
-	client := clientset.NewForConfigOrDie(&restclient.Config{Host: s.URL, ContentConfig: restclient.ContentConfig{GroupVersion: &api.Registry.GroupOrDie(v1.GroupName).GroupVersion}})
+	client := clientset.NewForConfigOrDie(&restclient.Config{Host: s.URL, ContentConfig: restclient.ContentConfig{GroupVersion: &schema.GroupVersion{Group: "", Version: "v1"}}})
 
 	pod := &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -173,7 +173,7 @@ func TestPodReadOnlyFilesystem(t *testing.T) {
 		},
 	}
 
-	if _, err := client.Core().Pods(ns.Name).Create(pod); err != nil {
+	if _, err := client.CoreV1().Pods(ns.Name).Create(pod); err != nil {
 		t.Errorf("Failed to create pod: %v", err)
 	}
 

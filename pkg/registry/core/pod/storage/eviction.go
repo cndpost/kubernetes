@@ -17,21 +17,25 @@ limitations under the License.
 package storage
 
 import (
+	"context"
 	"fmt"
+	"reflect"
 	"time"
 
+	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
-	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	genericregistry "k8s.io/apiserver/pkg/registry/generic/registry"
 	"k8s.io/apiserver/pkg/registry/rest"
-	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/apiserver/pkg/util/dryrun"
+	policyclient "k8s.io/client-go/kubernetes/typed/policy/v1beta1"
+	"k8s.io/client-go/util/retry"
+	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/apis/policy"
-	policyclient "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/typed/policy/internalversion"
-	"k8s.io/kubernetes/pkg/client/retry"
 )
 
 const (
@@ -64,24 +68,72 @@ type EvictionREST struct {
 }
 
 var _ = rest.Creater(&EvictionREST{})
+var _ = rest.GroupVersionKindProvider(&EvictionREST{})
+
+// GroupVersionKind specifies a particular GroupVersionKind to discovery
+func (r *EvictionREST) GroupVersionKind(containingGV schema.GroupVersion) schema.GroupVersionKind {
+	return schema.GroupVersionKind{Group: "policy", Version: "v1beta1", Kind: "Eviction"}
+}
 
 // New creates a new eviction resource
 func (r *EvictionREST) New() runtime.Object {
 	return &policy.Eviction{}
 }
 
+// Propagate dry-run takes the dry-run option from the request and pushes it into the eviction object.
+// It returns an error if they have non-matching dry-run options.
+func propagateDryRun(eviction *policy.Eviction, options *metav1.CreateOptions) (*metav1.DeleteOptions, error) {
+	if eviction.DeleteOptions == nil {
+		return &metav1.DeleteOptions{DryRun: options.DryRun}, nil
+	}
+	if len(eviction.DeleteOptions.DryRun) == 0 {
+		eviction.DeleteOptions.DryRun = options.DryRun
+		return eviction.DeleteOptions, nil
+	}
+	if len(options.DryRun) == 0 {
+		return eviction.DeleteOptions, nil
+	}
+
+	if !reflect.DeepEqual(options.DryRun, eviction.DeleteOptions.DryRun) {
+		return nil, fmt.Errorf("Non-matching dry-run options in request and content: %v and %v", options.DryRun, eviction.DeleteOptions.DryRun)
+	}
+	return eviction.DeleteOptions, nil
+}
+
 // Create attempts to create a new eviction.  That is, it tries to evict a pod.
-func (r *EvictionREST) Create(ctx genericapirequest.Context, obj runtime.Object) (runtime.Object, error) {
+func (r *EvictionREST) Create(ctx context.Context, obj runtime.Object, createValidation rest.ValidateObjectFunc, options *metav1.CreateOptions) (runtime.Object, error) {
 	eviction := obj.(*policy.Eviction)
 
-	obj, err := r.store.Get(ctx, eviction.Name, &metav1.GetOptions{})
+	deletionOptions, err := propagateDryRun(eviction, options)
+	if err != nil {
+		return nil, err
+	}
+
+	obj, err = r.store.Get(ctx, eviction.Name, &metav1.GetOptions{})
 	if err != nil {
 		return nil, err
 	}
 	pod := obj.(*api.Pod)
+
+	if createValidation != nil {
+		if err := createValidation(eviction.DeepCopyObject()); err != nil {
+			return nil, err
+		}
+	}
+
+	// Evicting a terminal pod should result in direct deletion of pod as it already caused disruption by the time we are evicting.
+	// There is no need to check for pdb.
+	if pod.Status.Phase == api.PodSucceeded || pod.Status.Phase == api.PodFailed {
+		_, _, err = r.store.Delete(ctx, eviction.Name, rest.ValidateAllObjectFunc, deletionOptions)
+		if err != nil {
+			return nil, err
+		}
+		return &metav1.Status{
+			Status: metav1.StatusSuccess}, nil
+	}
 	var rtStatus *metav1.Status
 	var pdbName string
-	err = retry.RetryOnConflict(EvictionsRetry, func() error {
+	err = func() error {
 		pdbs, err := r.getPodDisruptionBudgets(ctx, pod)
 		if err != nil {
 			return err
@@ -94,34 +146,33 @@ func (r *EvictionREST) Create(ctx genericapirequest.Context, obj runtime.Object)
 				Code:    500,
 			}
 			return nil
-		} else if len(pdbs) == 1 {
-			pdb := pdbs[0]
-			pdbName = pdb.Name
+		}
+		if len(pdbs) == 0 {
+			return nil
+		}
+
+		pdb := &pdbs[0]
+		pdbName = pdb.Name
+		refresh := false
+		err = retry.RetryOnConflict(EvictionsRetry, func() error {
+			if refresh {
+				pdb, err = r.podDisruptionBudgetClient.PodDisruptionBudgets(pod.Namespace).Get(pdbName, metav1.GetOptions{})
+				if err != nil {
+					return err
+				}
+			}
 			// Try to verify-and-decrement
 
 			// If it was false already, or if it becomes false during the course of our retries,
 			// raise an error marked as a 429.
-			ok, err := r.checkAndDecrement(pod.Namespace, pod.Name, pdb)
-			if err != nil {
+			if err = r.checkAndDecrement(pod.Namespace, pod.Name, *pdb, dryrun.IsDryRun(deletionOptions.DryRun)); err != nil {
+				refresh = true
 				return err
 			}
-
-			if !ok {
-				rtStatus = &metav1.Status{
-					Status: metav1.StatusFailure,
-					// TODO(mml): Include some more details about why the eviction is disallowed.
-					// Ideally any such text is generated by the DisruptionController (offline).
-					Message: "Cannot evict pod as it would violate the pod's disruption budget.",
-					Code:    429,
-					// TODO(mml): Add a Retry-After header.  Once there are time-based
-					// budgets, we can sometimes compute a sensible suggested value.  But
-					// even without that, we can give a suggestion (10 minutes?) that
-					// prevents well-behaved clients from hammering us.
-				}
-			}
-		}
-		return nil
-	})
+			return nil
+		})
+		return err
+	}()
 	if err == wait.ErrWaitTimeout {
 		err = errors.NewTimeoutError(fmt.Sprintf("couldn't update PodDisruptionBudget %q due to conflicts", pdbName), 10)
 	}
@@ -133,10 +184,10 @@ func (r *EvictionREST) Create(ctx genericapirequest.Context, obj runtime.Object)
 		return rtStatus, nil
 	}
 
-	// At this point there was either no PDB or we succeded in decrementing
+	// At this point there was either no PDB or we succeeded in decrementing
 
 	// Try the delete
-	_, _, err = r.store.Delete(ctx, eviction.Name, eviction.DeleteOptions)
+	_, _, err = r.store.Delete(ctx, eviction.Name, rest.ValidateAllObjectFunc, deletionOptions)
 	if err != nil {
 		return nil, err
 	}
@@ -146,37 +197,52 @@ func (r *EvictionREST) Create(ctx genericapirequest.Context, obj runtime.Object)
 }
 
 // checkAndDecrement checks if the provided PodDisruptionBudget allows any disruption.
-func (r *EvictionREST) checkAndDecrement(namespace string, podName string, pdb policy.PodDisruptionBudget) (ok bool, err error) {
+func (r *EvictionREST) checkAndDecrement(namespace string, podName string, pdb policyv1beta1.PodDisruptionBudget, dryRun bool) error {
 	if pdb.Status.ObservedGeneration < pdb.Generation {
-		return false, nil
+		// TODO(mml): Add a Retry-After header.  Once there are time-based
+		// budgets, we can sometimes compute a sensible suggested value.  But
+		// even without that, we can give a suggestion (10 minutes?) that
+		// prevents well-behaved clients from hammering us.
+		err := errors.NewTooManyRequests("Cannot evict pod as it would violate the pod's disruption budget.", 0)
+		err.ErrStatus.Details.Causes = append(err.ErrStatus.Details.Causes, metav1.StatusCause{Type: "DisruptionBudget", Message: fmt.Sprintf("The disruption budget %s is still being processed by the server.", pdb.Name)})
+		return err
 	}
 	if pdb.Status.PodDisruptionsAllowed < 0 {
-		return false, errors.NewForbidden(policy.Resource("poddisruptionbudget"), pdb.Name, fmt.Errorf("pdb disruptions allowed is negative"))
+		return errors.NewForbidden(policy.Resource("poddisruptionbudget"), pdb.Name, fmt.Errorf("pdb disruptions allowed is negative"))
 	}
 	if len(pdb.Status.DisruptedPods) > MaxDisruptedPodSize {
-		return false, errors.NewForbidden(policy.Resource("poddisruptionbudget"), pdb.Name, fmt.Errorf("DisrputedPods map too big - too many evictions not confirmed by PDB controller"))
+		return errors.NewForbidden(policy.Resource("poddisruptionbudget"), pdb.Name, fmt.Errorf("DisruptedPods map too big - too many evictions not confirmed by PDB controller"))
 	}
 	if pdb.Status.PodDisruptionsAllowed == 0 {
-		return false, nil
+		err := errors.NewTooManyRequests("Cannot evict pod as it would violate the pod's disruption budget.", 0)
+		err.ErrStatus.Details.Causes = append(err.ErrStatus.Details.Causes, metav1.StatusCause{Type: "DisruptionBudget", Message: fmt.Sprintf("The disruption budget %s needs %d healthy pods and has %d currently", pdb.Name, pdb.Status.DesiredHealthy, pdb.Status.CurrentHealthy)})
+		return err
 	}
+
 	pdb.Status.PodDisruptionsAllowed--
+	// If this is a dry-run, we don't need to go any further than that.
+	if dryRun == true {
+		return nil
+	}
+
 	if pdb.Status.DisruptedPods == nil {
 		pdb.Status.DisruptedPods = make(map[string]metav1.Time)
 	}
+
 	// Eviction handler needs to inform the PDB controller that it is about to delete a pod
 	// so it should not consider it as available in calculations when updating PodDisruptions allowed.
 	// If the pod is not deleted within a reasonable time limit PDB controller will assume that it won't
 	// be deleted at all and remove it from DisruptedPod map.
 	pdb.Status.DisruptedPods[podName] = metav1.Time{Time: time.Now()}
 	if _, err := r.podDisruptionBudgetClient.PodDisruptionBudgets(namespace).UpdateStatus(&pdb); err != nil {
-		return false, err
+		return err
 	}
 
-	return true, nil
+	return nil
 }
 
 // getPodDisruptionBudgets returns any PDBs that match the pod or err if there's an error.
-func (r *EvictionREST) getPodDisruptionBudgets(ctx genericapirequest.Context, pod *api.Pod) ([]policy.PodDisruptionBudget, error) {
+func (r *EvictionREST) getPodDisruptionBudgets(ctx context.Context, pod *api.Pod) ([]policyv1beta1.PodDisruptionBudget, error) {
 	if len(pod.Labels) == 0 {
 		return nil, nil
 	}
@@ -186,7 +252,7 @@ func (r *EvictionREST) getPodDisruptionBudgets(ctx genericapirequest.Context, po
 		return nil, err
 	}
 
-	var pdbs []policy.PodDisruptionBudget
+	var pdbs []policyv1beta1.PodDisruptionBudget
 	for _, pdb := range pdbList.Items {
 		if pdb.Namespace != pod.Namespace {
 			continue

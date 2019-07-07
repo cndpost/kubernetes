@@ -1,11 +1,4 @@
-package(default_visibility = ["//visibility:public"])
-
-licenses(["notice"])
-
-load(
-    "@io_bazel_rules_go//go:def.bzl",
-    "go_library",
-)
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "go_default_library",
@@ -17,7 +10,9 @@ go_library(
         "int64.go",
         "string.go",
     ],
-    tags = ["automanaged"],
+    importmap = "k8s.io/kubernetes/vendor/k8s.io/gengo/examples/set-gen/sets",
+    importpath = "k8s.io/gengo/examples/set-gen/sets",
+    visibility = ["//visibility:public"],
 )
 
 filegroup(
@@ -31,4 +26,5 @@ filegroup(
     name = "all-srcs",
     srcs = [":package-srcs"],
     tags = ["automanaged"],
+    visibility = ["//visibility:public"],
 )

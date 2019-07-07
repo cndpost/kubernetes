@@ -19,10 +19,11 @@ package main
 import (
 	"flag"
 	"os"
-	"runtime"
 
-	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/apiserver/pkg/util/logs"
+	"k8s.io/klog"
+
+	genericapiserver "k8s.io/apiserver/pkg/server"
+	"k8s.io/component-base/logs"
 	"k8s.io/kube-aggregator/pkg/cmd/server"
 
 	// force compilation of packages we'll later rely upon
@@ -30,20 +31,18 @@ import (
 	_ "k8s.io/kube-aggregator/pkg/apis/apiregistration/validation"
 	_ "k8s.io/kube-aggregator/pkg/client/clientset_generated/internalclientset"
 	_ "k8s.io/kube-aggregator/pkg/client/listers/apiregistration/internalversion"
-	_ "k8s.io/kube-aggregator/pkg/client/listers/apiregistration/v1alpha1"
+	_ "k8s.io/kube-aggregator/pkg/client/listers/apiregistration/v1beta1"
 )
 
 func main() {
 	logs.InitLogs()
 	defer logs.FlushLogs()
 
-	if len(os.Getenv("GOMAXPROCS")) == 0 {
-		runtime.GOMAXPROCS(runtime.NumCPU())
-	}
-
-	cmd := server.NewCommandStartAggregator(os.Stdout, os.Stderr, wait.NeverStop)
+	stopCh := genericapiserver.SetupSignalHandler()
+	options := server.NewDefaultOptions(os.Stdout, os.Stderr)
+	cmd := server.NewCommandStartAggregator(options, stopCh)
 	cmd.Flags().AddGoFlagSet(flag.CommandLine)
 	if err := cmd.Execute(); err != nil {
-		panic(err)
+		klog.Fatal(err)
 	}
 }

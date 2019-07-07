@@ -17,24 +17,27 @@ limitations under the License.
 package cronjob
 
 import (
-	"sort"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	batchv1 "k8s.io/api/batch/v1"
+	batchV1beta1 "k8s.io/api/batch/v1beta1"
+	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/record"
-	"k8s.io/kubernetes/pkg/api/v1"
-	batchv1 "k8s.io/kubernetes/pkg/apis/batch/v1"
-	batchv2alpha1 "k8s.io/kubernetes/pkg/apis/batch/v2alpha1"
-	"k8s.io/kubernetes/pkg/controller"
+	// For the cronjob controller to do conversions.
+	_ "k8s.io/kubernetes/pkg/apis/batch/install"
+	_ "k8s.io/kubernetes/pkg/apis/core/install"
 )
 
-// schedule is hourly on the hour
 var (
-	onTheHour string = "0 * * * ?"
+	// schedule is hourly on the hour
+	onTheHour     = "0 * * * ?"
+	errorSchedule = "obvious error schedule"
 )
 
 func justBeforeTheHour() time.Time {
@@ -94,19 +97,19 @@ func startTimeStringToTime(startTime string) time.Time {
 }
 
 // returns a cronJob with some fields filled in.
-func cronJob() batchv2alpha1.CronJob {
-	return batchv2alpha1.CronJob{
+func cronJob() batchV1beta1.CronJob {
+	return batchV1beta1.CronJob{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              "mycronjob",
 			Namespace:         "snazzycats",
 			UID:               types.UID("1a2b3c"),
-			SelfLink:          "/apis/batch/v2alpha1/namespaces/snazzycats/cronjobs/mycronjob",
+			SelfLink:          "/apis/batch/v1beta1/namespaces/snazzycats/cronjobs/mycronjob",
 			CreationTimestamp: metav1.Time{Time: justBeforeTheHour()},
 		},
-		Spec: batchv2alpha1.CronJobSpec{
+		Spec: batchV1beta1.CronJobSpec{
 			Schedule:          "* * * * ?",
-			ConcurrencyPolicy: batchv2alpha1.AllowConcurrent,
-			JobTemplate: batchv2alpha1.JobTemplateSpec{
+			ConcurrencyPolicy: batchV1beta1.AllowConcurrent,
+			JobTemplate: batchV1beta1.JobTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels:      map[string]string{"a": "b"},
 					Annotations: map[string]string{"x": "y"},
@@ -150,15 +153,15 @@ func newJob(UID string) batchv1.Job {
 }
 
 var (
-	shortDead  int64                           = 10
-	mediumDead int64                           = 2 * 60 * 60
-	longDead   int64                           = 1000000
-	noDead     int64                           = -12345
-	A          batchv2alpha1.ConcurrencyPolicy = batchv2alpha1.AllowConcurrent
-	f          batchv2alpha1.ConcurrencyPolicy = batchv2alpha1.ForbidConcurrent
-	R          batchv2alpha1.ConcurrencyPolicy = batchv2alpha1.ReplaceConcurrent
-	T          bool                            = true
-	F          bool                            = false
+	shortDead  int64 = 10
+	mediumDead int64 = 2 * 60 * 60
+	longDead   int64 = 1000000
+	noDead     int64 = -12345
+	A                = batchV1beta1.AllowConcurrent
+	f                = batchV1beta1.ForbidConcurrent
+	R                = batchV1beta1.ReplaceConcurrent
+	T                = true
+	F                = false
 )
 
 func TestSyncOne_RunOrNot(t *testing.T) {
@@ -177,7 +180,7 @@ func TestSyncOne_RunOrNot(t *testing.T) {
 
 	testCases := map[string]struct {
 		// sj spec
-		concurrencyPolicy batchv2alpha1.ConcurrencyPolicy
+		concurrencyPolicy batchV1beta1.ConcurrencyPolicy
 		suspend           bool
 		schedule          string
 		deadline          int64
@@ -195,6 +198,9 @@ func TestSyncOne_RunOrNot(t *testing.T) {
 		expectActive     int
 		expectedWarnings int
 	}{
+		"never ran, not valid schedule, A":      {A, F, errorSchedule, noDead, F, F, justBeforeTheHour(), F, F, 0, 1},
+		"never ran, not valid schedule, F":      {f, F, errorSchedule, noDead, F, F, justBeforeTheHour(), F, F, 0, 1},
+		"never ran, not valid schedule, R":      {f, F, errorSchedule, noDead, F, F, justBeforeTheHour(), F, F, 0, 1},
 		"never ran, not time, A":                {A, F, onTheHour, noDead, F, F, justBeforeTheHour(), F, F, 0, 0},
 		"never ran, not time, F":                {f, F, onTheHour, noDead, F, F, justBeforeTheHour(), F, F, 0, 0},
 		"never ran, not time, R":                {R, F, onTheHour, noDead, F, F, justBeforeTheHour(), F, F, 0, 0},
@@ -279,10 +285,9 @@ func TestSyncOne_RunOrNot(t *testing.T) {
 
 		jc := &fakeJobControl{Job: job}
 		sjc := &fakeSJControl{}
-		pc := &fakePodControl{}
 		recorder := record.NewFakeRecorder(10)
 
-		syncOne(&sj, js, tc.now, jc, sjc, pc, recorder)
+		syncOne(&sj, js, tc.now, jc, sjc, recorder)
 		expectedCreates := 0
 		if tc.expectCreate {
 			expectedCreates = 1
@@ -292,11 +297,11 @@ func TestSyncOne_RunOrNot(t *testing.T) {
 		}
 		for i := range jc.Jobs {
 			job := &jc.Jobs[i]
-			controllerRef := controller.GetControllerOf(job)
+			controllerRef := metav1.GetControllerOf(job)
 			if controllerRef == nil {
 				t.Errorf("%s: expected job to have ControllerRef: %#v", name, job)
 			} else {
-				if got, want := controllerRef.APIVersion, "batch/v2alpha1"; got != want {
+				if got, want := controllerRef.APIVersion, "batch/v1beta1"; got != want {
 					t.Errorf("%s: controllerRef.APIVersion = %q, want %q", name, got, want)
 				}
 				if got, want := controllerRef.Kind, "CronJob"; got != want {
@@ -342,7 +347,7 @@ func TestSyncOne_RunOrNot(t *testing.T) {
 		for i := 1; i <= len(recorder.Events); i++ {
 			e := <-recorder.Events
 			if strings.HasPrefix(e, v1.EventTypeWarning) {
-				numWarnings += 1
+				numWarnings++
 			}
 		}
 		if numWarnings != tc.expectedWarnings {
@@ -507,7 +512,7 @@ func TestCleanupFinishedJobs_DeleteOrNot(t *testing.T) {
 
 		// Create jobs
 		js := []batchv1.Job{}
-		jobsToDelete := []string{}
+		jobsToDelete := sets.NewString()
 		sj.Status.Active = []v1.ObjectReference{}
 
 		for i, spec := range tc.jobSpecs {
@@ -541,32 +546,31 @@ func TestCleanupFinishedJobs_DeleteOrNot(t *testing.T) {
 
 			js = append(js, *job)
 			if spec.ExpectDelete {
-				jobsToDelete = append(jobsToDelete, job.Name)
+				jobsToDelete.Insert(job.Name)
 			}
 		}
 
 		jc := &fakeJobControl{Job: job}
-		pc := &fakePodControl{}
 		sjc := &fakeSJControl{}
 		recorder := record.NewFakeRecorder(10)
 
-		cleanupFinishedJobs(&sj, js, jc, sjc, pc, recorder)
+		cleanupFinishedJobs(&sj, js, jc, sjc, recorder)
 
 		// Check we have actually deleted the correct jobs
 		if len(jc.DeleteJobName) != len(jobsToDelete) {
 			t.Errorf("%s: expected %d job deleted, actually %d", name, len(jobsToDelete), len(jc.DeleteJobName))
 		} else {
-			sort.Strings(jobsToDelete)
-			sort.Strings(jc.DeleteJobName)
-			for i, expectedJobName := range jobsToDelete {
-				if expectedJobName != jc.DeleteJobName[i] {
-					t.Errorf("%s: expected job %s deleted, actually %v -- %v vs %v", name, expectedJobName, jc.DeleteJobName[i], jc.DeleteJobName, jobsToDelete)
-				}
+			jcDeleteJobName := sets.NewString(jc.DeleteJobName...)
+			if !jcDeleteJobName.Equal(jobsToDelete) {
+				t.Errorf("%s: expected jobs: %v deleted, actually: %v deleted", name, jobsToDelete, jcDeleteJobName)
 			}
 		}
 
 		// Check for events
 		expectedEvents := len(jobsToDelete)
+		if name == "failed list pod err" {
+			expectedEvents = len(tc.jobSpecs)
+		}
 		if len(recorder.Events) != expectedEvents {
 			t.Errorf("%s: expected %d event, actually %v", name, expectedEvents, len(recorder.Events))
 		}
@@ -594,7 +598,7 @@ func TestSyncOne_Status(t *testing.T) {
 
 	testCases := map[string]struct {
 		// sj spec
-		concurrencyPolicy batchv2alpha1.ConcurrencyPolicy
+		concurrencyPolicy batchV1beta1.ConcurrencyPolicy
 		suspend           bool
 		schedule          string
 		deadline          int64
@@ -708,11 +712,10 @@ func TestSyncOne_Status(t *testing.T) {
 
 		jc := &fakeJobControl{}
 		sjc := &fakeSJControl{}
-		pc := &fakePodControl{}
 		recorder := record.NewFakeRecorder(10)
 
 		// Run the code
-		syncOne(&sj, jobs, tc.now, jc, sjc, pc, recorder)
+		syncOne(&sj, jobs, tc.now, jc, sjc, recorder)
 
 		// Status update happens once when ranging through job list, and another one if create jobs.
 		expectUpdates := 1

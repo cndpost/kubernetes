@@ -23,26 +23,28 @@ import (
 	"sort"
 	"time"
 
-	"github.com/golang/glog"
 	"k8s.io/apimachinery/pkg/types"
-	internalapi "k8s.io/kubernetes/pkg/kubelet/api"
-	runtimeapi "k8s.io/kubernetes/pkg/kubelet/api/v1alpha1/runtime"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/sets"
+	internalapi "k8s.io/cri-api/pkg/apis"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	"k8s.io/klog"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 )
 
 // containerGC is the manager of garbage collection.
 type containerGC struct {
-	client    internalapi.RuntimeService
-	manager   *kubeGenericRuntimeManager
-	podGetter podGetter
+	client           internalapi.RuntimeService
+	manager          *kubeGenericRuntimeManager
+	podStateProvider podStateProvider
 }
 
 // NewContainerGC creates a new containerGC.
-func NewContainerGC(client internalapi.RuntimeService, podGetter podGetter, manager *kubeGenericRuntimeManager) *containerGC {
+func newContainerGC(client internalapi.RuntimeService, podStateProvider podStateProvider, manager *kubeGenericRuntimeManager) *containerGC {
 	return &containerGC{
-		client:    client,
-		manager:   manager,
-		podGetter: podGetter,
+		client:           client,
+		manager:          manager,
+		podStateProvider: podStateProvider,
 	}
 }
 
@@ -52,10 +54,11 @@ type containerGCInfo struct {
 	id string
 	// The name of the container.
 	name string
-	// The sandbox ID which this container belongs to
-	sandboxID string
 	// Creation time for the container.
 	createTime time.Time
+	// If true, the container is in unknown state. Garbage collector should try
+	// to stop containers before removal.
+	unknown bool
 }
 
 // sandboxGCInfo is the internal information kept for sandboxes being considered for GC.
@@ -123,8 +126,21 @@ func (cgc *containerGC) removeOldestN(containers []containerGCInfo, toRemove int
 	// Remove from oldest to newest (last to first).
 	numToKeep := len(containers) - toRemove
 	for i := len(containers) - 1; i >= numToKeep; i-- {
+		if containers[i].unknown {
+			// Containers in known state could be running, we should try
+			// to stop it before removal.
+			id := kubecontainer.ContainerID{
+				Type: cgc.manager.runtimeName,
+				ID:   containers[i].id,
+			}
+			message := "Container is in unknown state, try killing it before removal"
+			if err := cgc.manager.killContainer(nil, id, containers[i].name, message, nil); err != nil {
+				klog.Errorf("Failed to stop container %q: %v", containers[i].id, err)
+				continue
+			}
+		}
 		if err := cgc.manager.removeContainer(containers[i].id); err != nil {
-			glog.Errorf("Failed to remove container %q: %v", containers[i].id, err)
+			klog.Errorf("Failed to remove container %q: %v", containers[i].id, err)
 		}
 	}
 
@@ -146,23 +162,17 @@ func (cgc *containerGC) removeOldestNSandboxes(sandboxes []sandboxGCInfo, toRemo
 
 // removeSandbox removes the sandbox by sandboxID.
 func (cgc *containerGC) removeSandbox(sandboxID string) {
-	glog.V(4).Infof("Removing sandbox %q", sandboxID)
+	klog.V(4).Infof("Removing sandbox %q", sandboxID)
 	// In normal cases, kubelet should've already called StopPodSandbox before
 	// GC kicks in. To guard against the rare cases where this is not true, try
 	// stopping the sandbox before removing it.
 	if err := cgc.client.StopPodSandbox(sandboxID); err != nil {
-		glog.Errorf("Failed to stop sandbox %q before removing: %v", sandboxID, err)
+		klog.Errorf("Failed to stop sandbox %q before removing: %v", sandboxID, err)
 		return
 	}
 	if err := cgc.client.RemovePodSandbox(sandboxID); err != nil {
-		glog.Errorf("Failed to remove sandbox %q: %v", sandboxID, err)
+		klog.Errorf("Failed to remove sandbox %q: %v", sandboxID, err)
 	}
-}
-
-// isPodDeleted returns true if the pod is already deleted.
-func (cgc *containerGC) isPodDeleted(podUID types.UID) bool {
-	_, found := cgc.podGetter.GetPodByUID(podUID)
-	return !found
 }
 
 // evictableContainers gets all containers that are evictable. Evictable containers are: not running
@@ -191,7 +201,7 @@ func (cgc *containerGC) evictableContainers(minAge time.Duration) (containersByE
 			id:         container.Id,
 			name:       container.Metadata.Name,
 			createTime: createdAt,
-			sandboxID:  container.PodSandboxId,
+			unknown:    container.State == runtimeapi.ContainerState_CONTAINER_UNKNOWN,
 		}
 		key := evictUnit{
 			uid:  labeledInfo.PodUID,
@@ -209,7 +219,7 @@ func (cgc *containerGC) evictableContainers(minAge time.Duration) (containersByE
 }
 
 // evict all containers that are evictable
-func (cgc *containerGC) evictContainers(gcPolicy kubecontainer.ContainerGCPolicy, allSourcesReady bool) error {
+func (cgc *containerGC) evictContainers(gcPolicy kubecontainer.ContainerGCPolicy, allSourcesReady bool, evictTerminatedPods bool) error {
 	// Separate containers by evict units.
 	evictUnits, err := cgc.evictableContainers(gcPolicy.MinAge)
 	if err != nil {
@@ -219,7 +229,7 @@ func (cgc *containerGC) evictContainers(gcPolicy kubecontainer.ContainerGCPolicy
 	// Remove deleted pod containers if all sources are ready.
 	if allSourcesReady {
 		for key, unit := range evictUnits {
-			if cgc.isPodDeleted(key.uid) {
+			if cgc.podStateProvider.IsPodDeleted(key.uid) || (cgc.podStateProvider.IsPodTerminated(key.uid) && evictTerminatedPods) {
 				cgc.removeOldestN(unit, len(unit)) // Remove all.
 				delete(evictUnits, key)
 			}
@@ -261,10 +271,16 @@ func (cgc *containerGC) evictContainers(gcPolicy kubecontainer.ContainerGCPolicy
 //   2. contains no containers.
 //   3. belong to a non-existent (i.e., already removed) pod, or is not the
 //      most recently created sandbox for the pod.
-func (cgc *containerGC) evictSandboxes() error {
+func (cgc *containerGC) evictSandboxes(evictTerminatedPods bool) error {
 	containers, err := cgc.manager.getKubeletContainers(true)
 	if err != nil {
 		return err
+	}
+
+	// collect all the PodSandboxId of container
+	sandboxIDs := sets.NewString()
+	for _, container := range containers {
+		sandboxIDs.Insert(container.PodSandboxId)
 	}
 
 	sandboxes, err := cgc.manager.getKubeletSandboxes(true)
@@ -286,15 +302,7 @@ func (cgc *containerGC) evictSandboxes() error {
 		}
 
 		// Set sandboxes that still have containers to be active.
-		hasContainers := false
-		sandboxID := sandbox.Id
-		for _, container := range containers {
-			if container.PodSandboxId == sandboxID {
-				hasContainers = true
-				break
-			}
-		}
-		if hasContainers {
+		if sandboxIDs.Has(sandbox.Id) {
 			sandboxInfo.active = true
 		}
 
@@ -307,7 +315,7 @@ func (cgc *containerGC) evictSandboxes() error {
 	}
 
 	for podUID, sandboxes := range sandboxesByPod {
-		if cgc.isPodDeleted(podUID) {
+		if cgc.podStateProvider.IsPodDeleted(podUID) || (cgc.podStateProvider.IsPodTerminated(podUID) && evictTerminatedPods) {
 			// Remove all evictable sandboxes if the pod has been removed.
 			// Note that the latest dead sandbox is also removed if there is
 			// already an active one.
@@ -332,13 +340,13 @@ func (cgc *containerGC) evictPodLogsDirectories(allSourcesReady bool) error {
 		}
 		for _, dir := range dirs {
 			name := dir.Name()
-			podUID := types.UID(name)
-			if !cgc.isPodDeleted(podUID) {
+			podUID := parsePodUIDFromLogsDirectory(name)
+			if !cgc.podStateProvider.IsPodDeleted(podUID) {
 				continue
 			}
 			err := osInterface.RemoveAll(filepath.Join(podLogsRootDirectory, name))
 			if err != nil {
-				glog.Errorf("Failed to remove pod logs directory %q: %v", name, err)
+				klog.Errorf("Failed to remove pod logs directory %q: %v", name, err)
 			}
 		}
 	}
@@ -350,7 +358,7 @@ func (cgc *containerGC) evictPodLogsDirectories(allSourcesReady bool) error {
 		if _, err := osInterface.Stat(logSymlink); os.IsNotExist(err) {
 			err := osInterface.Remove(logSymlink)
 			if err != nil {
-				glog.Errorf("Failed to remove container log dead symlink %q: %v", logSymlink, err)
+				klog.Errorf("Failed to remove container log dead symlink %q: %v", logSymlink, err)
 			}
 		}
 	}
@@ -367,17 +375,21 @@ func (cgc *containerGC) evictPodLogsDirectories(allSourcesReady bool) error {
 // * removes oldest dead containers by enforcing gcPolicy.MaxContainers.
 // * gets evictable sandboxes which are not ready and contains no containers.
 // * removes evictable sandboxes.
-func (cgc *containerGC) GarbageCollect(gcPolicy kubecontainer.ContainerGCPolicy, allSourcesReady bool) error {
+func (cgc *containerGC) GarbageCollect(gcPolicy kubecontainer.ContainerGCPolicy, allSourcesReady bool, evictTerminatedPods bool) error {
+	errors := []error{}
 	// Remove evictable containers
-	if err := cgc.evictContainers(gcPolicy, allSourcesReady); err != nil {
-		return err
+	if err := cgc.evictContainers(gcPolicy, allSourcesReady, evictTerminatedPods); err != nil {
+		errors = append(errors, err)
 	}
 
 	// Remove sandboxes with zero containers
-	if err := cgc.evictSandboxes(); err != nil {
-		return err
+	if err := cgc.evictSandboxes(evictTerminatedPods); err != nil {
+		errors = append(errors, err)
 	}
 
 	// Remove pod sandbox log directory
-	return cgc.evictPodLogsDirectories(allSourcesReady)
+	if err := cgc.evictPodLogsDirectories(allSourcesReady); err != nil {
+		errors = append(errors, err)
+	}
+	return utilerrors.NewAggregate(errors)
 }

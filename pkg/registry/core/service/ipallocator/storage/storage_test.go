@@ -17,24 +17,23 @@ limitations under the License.
 package storage
 
 import (
+	"context"
 	"net"
 	"strings"
 	"testing"
 
 	"k8s.io/apiserver/pkg/registry/generic"
 	"k8s.io/apiserver/pkg/storage"
-	etcdtesting "k8s.io/apiserver/pkg/storage/etcd/testing"
+	etcd3testing "k8s.io/apiserver/pkg/storage/etcd3/testing"
 	"k8s.io/apiserver/pkg/storage/storagebackend/factory"
-	"k8s.io/kubernetes/pkg/api"
+	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/registry/core/service/allocator"
 	allocatorstore "k8s.io/kubernetes/pkg/registry/core/service/allocator/storage"
 	"k8s.io/kubernetes/pkg/registry/core/service/ipallocator"
 	"k8s.io/kubernetes/pkg/registry/registrytest"
-
-	"golang.org/x/net/context"
 )
 
-func newStorage(t *testing.T) (*etcdtesting.EtcdTestServer, ipallocator.Interface, allocator.Interface, storage.Interface, factory.DestroyFunc) {
+func newStorage(t *testing.T) (*etcd3testing.EtcdTestServer, ipallocator.Interface, allocator.Interface, storage.Interface, factory.DestroyFunc) {
 	etcdStorage, server := registrytest.NewEtcdStorage(t, "")
 	_, cidr, err := net.ParseCIDR("192.168.1.0/24")
 	if err != nil {
@@ -78,7 +77,8 @@ func TestEmpty(t *testing.T) {
 func TestErrors(t *testing.T) {
 	_, storage, _, _, destroyFunc := newStorage(t)
 	defer destroyFunc()
-	if err := storage.Allocate(net.ParseIP("192.168.0.0")); err != ipallocator.ErrNotInRange {
+	err := storage.Allocate(net.ParseIP("192.168.0.0"))
+	if _, ok := err.(*ipallocator.ErrNotInRange); !ok {
 		t.Fatal(err)
 	}
 }

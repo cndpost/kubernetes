@@ -1,4 +1,6 @@
+# See the OWNERS docs at https://go.k8s.io/owners
+
 approvers:
-- test-infra-maintainers
+- sig-testing-approvers
 reviewers:
-- test-infra-maintainers
+- sig-testing-reviewers

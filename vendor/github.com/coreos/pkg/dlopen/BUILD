@@ -1,33 +1,16 @@
-package(default_visibility = ["//visibility:public"])
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
-licenses(["notice"])
-
-load(
-    "@io_bazel_rules_go//go:def.bzl",
-    "cgo_genrule",
-    "go_library",
-)
-
-cgo_genrule(
-    name = "cgo_codegen",
+go_library(
+    name = "go_default_library",
     srcs = [
         "dlopen.go",
         "dlopen_example.go",
     ],
-    clinkopts = [
-        "-lz",
-        "-lm",
-        "-lpthread",
-        "-ldl",
-    ],
-    tags = ["automanaged"],
-)
-
-go_library(
-    name = "go_default_library",
-    srcs = [],
-    library = ":cgo_codegen",
-    tags = ["automanaged"],
+    cgo = True,
+    clinkopts = ["-ldl"],
+    importmap = "k8s.io/kubernetes/vendor/github.com/coreos/pkg/dlopen",
+    importpath = "github.com/coreos/pkg/dlopen",
+    visibility = ["//visibility:public"],
 )
 
 filegroup(
@@ -41,4 +24,5 @@ filegroup(
     name = "all-srcs",
     srcs = [":package-srcs"],
     tags = ["automanaged"],
+    visibility = ["//visibility:public"],
 )

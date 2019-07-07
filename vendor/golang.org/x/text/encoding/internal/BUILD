@@ -1,16 +1,11 @@
-package(default_visibility = ["//visibility:public"])
-
-licenses(["notice"])
-
-load(
-    "@io_bazel_rules_go//go:def.bzl",
-    "go_library",
-)
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "go_default_library",
     srcs = ["internal.go"],
-    tags = ["automanaged"],
+    importmap = "k8s.io/kubernetes/vendor/golang.org/x/text/encoding/internal",
+    importpath = "golang.org/x/text/encoding/internal",
+    visibility = ["//visibility:public"],
     deps = [
         "//vendor/golang.org/x/text/encoding:go_default_library",
         "//vendor/golang.org/x/text/encoding/internal/identifier:go_default_library",
@@ -32,4 +27,5 @@ filegroup(
         "//vendor/golang.org/x/text/encoding/internal/identifier:all-srcs",
     ],
     tags = ["automanaged"],
+    visibility = ["//visibility:public"],
 )

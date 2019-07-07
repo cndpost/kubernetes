@@ -1,3 +1,5 @@
+# See the OWNERS docs at https://go.k8s.io/owners
+
 reviewers:
 - lavalamp
 - smarterclayton
@@ -12,7 +14,7 @@ reviewers:
 - luxas
 - janetkuo
 - roberthbailey
-- timstclair
+- tallclair
 - timothysc
 - dims
 - hongchaodeng
@@ -22,3 +24,4 @@ reviewers:
 - pweil-
 - mqliang
 - feihujiang
+- enj

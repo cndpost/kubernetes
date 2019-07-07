@@ -1,16 +1,10 @@
-package(default_visibility = ["//visibility:public"])
-
-licenses(["notice"])
-
-load(
-    "@io_bazel_rules_go//go:def.bzl",
-    "go_library",
-)
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "go_default_library",
     srcs = [
         "auth_options.go",
+        "auth_result.go",
         "doc.go",
         "endpoint_search.go",
         "errors.go",
@@ -20,7 +14,9 @@ go_library(
         "service_client.go",
         "util.go",
     ],
-    tags = ["automanaged"],
+    importmap = "k8s.io/kubernetes/vendor/github.com/gophercloud/gophercloud",
+    importpath = "github.com/gophercloud/gophercloud",
+    visibility = ["//visibility:public"],
 )
 
 filegroup(
@@ -38,4 +34,5 @@ filegroup(
         "//vendor/github.com/gophercloud/gophercloud/pagination:all-srcs",
     ],
     tags = ["automanaged"],
+    visibility = ["//visibility:public"],
 )

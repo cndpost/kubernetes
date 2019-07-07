@@ -1,11 +1,4 @@
-package(default_visibility = ["//visibility:public"])
-
-licenses(["notice"])
-
-load(
-    "@io_bazel_rules_go//go:def.bzl",
-    "go_library",
-)
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "go_default_library",
@@ -15,7 +8,9 @@ go_library(
         "descriptor_gostring.gen.go",
         "helper.go",
     ],
-    tags = ["automanaged"],
+    importmap = "k8s.io/kubernetes/vendor/github.com/gogo/protobuf/protoc-gen-gogo/descriptor",
+    importpath = "github.com/gogo/protobuf/protoc-gen-gogo/descriptor",
+    visibility = ["//visibility:public"],
     deps = ["//vendor/github.com/gogo/protobuf/proto:go_default_library"],
 )
 
@@ -30,4 +25,5 @@ filegroup(
     name = "all-srcs",
     srcs = [":package-srcs"],
     tags = ["automanaged"],
+    visibility = ["//visibility:public"],
 )

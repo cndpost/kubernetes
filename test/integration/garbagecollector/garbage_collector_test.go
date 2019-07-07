@@ -18,29 +18,34 @@ package garbagecollector
 
 import (
 	"fmt"
-	"net/http/httptest"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/golang/glog"
-
+	"k8s.io/api/core/v1"
+	apiextensionsv1beta1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
+	apiextensionsclientset "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
+	apiextensionstestserver "k8s.io/apiextensions-apiserver/test/integration/fixtures"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/serializer"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/discovery"
+	"k8s.io/apiserver/pkg/storage/names"
+	cacheddiscovery "k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/dynamic"
-	restclient "k8s.io/client-go/rest"
+	"k8s.io/client-go/dynamic/dynamicinformer"
+	"k8s.io/client-go/informers"
+	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/v1"
-	"k8s.io/kubernetes/pkg/client/clientset_generated/clientset"
+	kubeapiservertesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
+	"k8s.io/kubernetes/pkg/controller"
 	"k8s.io/kubernetes/pkg/controller/garbagecollector"
-	"k8s.io/kubernetes/pkg/controller/garbagecollector/metaonly"
 	"k8s.io/kubernetes/test/integration"
 	"k8s.io/kubernetes/test/integration/framework"
 )
@@ -53,6 +58,11 @@ func getForegroundOptions() *metav1.DeleteOptions {
 func getOrphanOptions() *metav1.DeleteOptions {
 	var trueVar = true
 	return &metav1.DeleteOptions{OrphanDependents: &trueVar}
+}
+
+func getPropagateOrphanOptions() *metav1.DeleteOptions {
+	policy := metav1.DeletePropagationOrphan
+	return &metav1.DeleteOptions{PropagationPolicy: &policy}
 }
 
 func getNonOrphanOptions() *metav1.DeleteOptions {
@@ -123,48 +133,193 @@ func newOwnerRC(name, namespace string) *v1.ReplicationController {
 	}
 }
 
-func setup(t *testing.T) (*httptest.Server, *garbagecollector.GarbageCollector, clientset.Interface) {
-	masterConfig := framework.NewIntegrationTestMasterConfig()
-	masterConfig.EnableCoreControllers = false
-	_, s := framework.RunAMaster(masterConfig)
+func newCRDInstance(definition *apiextensionsv1beta1.CustomResourceDefinition, namespace, name string) *unstructured.Unstructured {
+	return &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"kind":       definition.Spec.Names.Kind,
+			"apiVersion": definition.Spec.Group + "/" + definition.Spec.Version,
+			"metadata": map[string]interface{}{
+				"name":      name,
+				"namespace": namespace,
+			},
+		},
+	}
+}
 
-	clientSet, err := clientset.NewForConfig(&restclient.Config{Host: s.URL})
-	if err != nil {
-		t.Fatalf("Error in create clientset: %v", err)
+func newConfigMap(namespace, name string) *v1.ConfigMap {
+	return &v1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "ConfigMap",
+			APIVersion: "v1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      name,
+		},
 	}
-	preferredResources, err := clientSet.Discovery().ServerPreferredResources()
+}
+
+func link(t *testing.T, owner, dependent metav1.Object) {
+	ownerType, err := meta.TypeAccessor(owner)
 	if err != nil {
-		t.Fatalf("Failed to get supported resources from server: %v", err)
+		t.Fatalf("failed to get type info for %#v: %v", owner, err)
 	}
-	deletableResources := discovery.FilteredBy(discovery.SupportsAllVerbs{Verbs: []string{"delete"}}, preferredResources)
-	deletableGroupVersionResources, err := discovery.GroupVersionResources(deletableResources)
+	ref := metav1.OwnerReference{
+		Kind:       ownerType.GetKind(),
+		APIVersion: ownerType.GetAPIVersion(),
+		Name:       owner.GetName(),
+		UID:        owner.GetUID(),
+	}
+	dependent.SetOwnerReferences(append(dependent.GetOwnerReferences(), ref))
+}
+
+func createRandomCustomResourceDefinition(
+	t *testing.T, apiExtensionClient apiextensionsclientset.Interface,
+	dynamicClient dynamic.Interface,
+	namespace string,
+) (*apiextensionsv1beta1.CustomResourceDefinition, dynamic.ResourceInterface) {
+	// Create a random custom resource definition and ensure it's available for
+	// use.
+	definition := apiextensionstestserver.NewRandomNameCustomResourceDefinition(apiextensionsv1beta1.NamespaceScoped)
+
+	definition, err := apiextensionstestserver.CreateNewCustomResourceDefinition(definition, apiExtensionClient, dynamicClient)
 	if err != nil {
-		t.Fatalf("Failed to parse supported resources from server: %v", err)
+		t.Fatalf("failed to create CustomResourceDefinition: %v", err)
 	}
-	config := &restclient.Config{Host: s.URL}
-	config.ContentConfig.NegotiatedSerializer = serializer.DirectCodecFactory{CodecFactory: metaonly.NewMetadataCodecFactory()}
-	metaOnlyClientPool := dynamic.NewClientPool(config, api.Registry.RESTMapper(), dynamic.LegacyAPIPathResolverFunc)
-	config.ContentConfig.NegotiatedSerializer = nil
-	clientPool := dynamic.NewClientPool(config, api.Registry.RESTMapper(), dynamic.LegacyAPIPathResolverFunc)
-	gc, err := garbagecollector.NewGarbageCollector(metaOnlyClientPool, clientPool, api.Registry.RESTMapper(), deletableGroupVersionResources)
+
+	// Get a client for the custom resource.
+	gvr := schema.GroupVersionResource{Group: definition.Spec.Group, Version: definition.Spec.Version, Resource: definition.Spec.Names.Plural}
+
+	resourceClient := dynamicClient.Resource(gvr).Namespace(namespace)
+
+	return definition, resourceClient
+}
+
+type testContext struct {
+	tearDown           func()
+	gc                 *garbagecollector.GarbageCollector
+	clientSet          clientset.Interface
+	apiExtensionClient apiextensionsclientset.Interface
+	dynamicClient      dynamic.Interface
+	startGC            func(workers int)
+	// syncPeriod is how often the GC started with startGC will be resynced.
+	syncPeriod time.Duration
+}
+
+// if workerCount > 0, will start the GC, otherwise it's up to the caller to Run() the GC.
+func setup(t *testing.T, workerCount int) *testContext {
+	return setupWithServer(t, kubeapiservertesting.StartTestServerOrDie(t, nil, nil, framework.SharedEtcd()), workerCount)
+}
+
+func setupWithServer(t *testing.T, result *kubeapiservertesting.TestServer, workerCount int) *testContext {
+	clientSet, err := clientset.NewForConfig(result.ClientConfig)
 	if err != nil {
-		t.Fatalf("Failed to create garbage collector")
+		t.Fatalf("error creating clientset: %v", err)
 	}
-	return s, gc, clientSet
+
+	// Helpful stuff for testing CRD.
+	apiExtensionClient, err := apiextensionsclientset.NewForConfig(result.ClientConfig)
+	if err != nil {
+		t.Fatalf("error creating extension clientset: %v", err)
+	}
+	// CreateNewCustomResourceDefinition wants to use this namespace for verifying
+	// namespace-scoped CRD creation.
+	createNamespaceOrDie("aval", clientSet, t)
+
+	discoveryClient := cacheddiscovery.NewMemCacheClient(clientSet.Discovery())
+	restMapper := restmapper.NewDeferredDiscoveryRESTMapper(discoveryClient)
+	restMapper.Reset()
+	deletableResources := garbagecollector.GetDeletableResources(discoveryClient)
+	config := *result.ClientConfig
+	dynamicClient, err := dynamic.NewForConfig(&config)
+	if err != nil {
+		t.Fatalf("failed to create dynamicClient: %v", err)
+	}
+	sharedInformers := informers.NewSharedInformerFactory(clientSet, 0)
+	dynamicInformers := dynamicinformer.NewDynamicSharedInformerFactory(dynamicClient, 0)
+	alwaysStarted := make(chan struct{})
+	close(alwaysStarted)
+	gc, err := garbagecollector.NewGarbageCollector(
+		dynamicClient,
+		restMapper,
+		deletableResources,
+		garbagecollector.DefaultIgnoredResources(),
+		controller.NewInformerFactory(sharedInformers, dynamicInformers),
+		alwaysStarted,
+	)
+	if err != nil {
+		t.Fatalf("failed to create garbage collector: %v", err)
+	}
+
+	stopCh := make(chan struct{})
+	tearDown := func() {
+		close(stopCh)
+		result.TearDownFn()
+	}
+	syncPeriod := 5 * time.Second
+	startGC := func(workers int) {
+		go wait.Until(func() {
+			// Resetting the REST mapper will also invalidate the underlying discovery
+			// client. This is a leaky abstraction and assumes behavior about the REST
+			// mapper, but we'll deal with it for now.
+			restMapper.Reset()
+		}, syncPeriod, stopCh)
+		go gc.Run(workers, stopCh)
+		go gc.Sync(clientSet.Discovery(), syncPeriod, stopCh)
+	}
+
+	if workerCount > 0 {
+		startGC(workerCount)
+	}
+
+	return &testContext{
+		tearDown:           tearDown,
+		gc:                 gc,
+		clientSet:          clientSet,
+		apiExtensionClient: apiExtensionClient,
+		dynamicClient:      dynamicClient,
+		startGC:            startGC,
+		syncPeriod:         syncPeriod,
+	}
+}
+
+func createNamespaceOrDie(name string, c clientset.Interface, t *testing.T) *v1.Namespace {
+	ns := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: name}}
+	if _, err := c.CoreV1().Namespaces().Create(ns); err != nil {
+		t.Fatalf("failed to create namespace: %v", err)
+	}
+	falseVar := false
+	_, err := c.CoreV1().ServiceAccounts(ns.Name).Create(&v1.ServiceAccount{
+		ObjectMeta:                   metav1.ObjectMeta{Name: "default"},
+		AutomountServiceAccountToken: &falseVar,
+	})
+	if err != nil {
+		t.Fatalf("failed to create service account: %v", err)
+	}
+	return ns
+}
+
+func deleteNamespaceOrDie(name string, c clientset.Interface, t *testing.T) {
+	zero := int64(0)
+	background := metav1.DeletePropagationBackground
+	err := c.CoreV1().Namespaces().Delete(name, &metav1.DeleteOptions{GracePeriodSeconds: &zero, PropagationPolicy: &background})
+	if err != nil {
+		t.Fatalf("failed to delete namespace %q: %v", name, err)
+	}
 }
 
 // This test simulates the cascading deletion.
 func TestCascadingDeletion(t *testing.T) {
-	glog.V(6).Infof("TestCascadingDeletion starts")
-	defer glog.V(6).Infof("TestCascadingDeletion ends")
-	s, gc, clientSet := setup(t)
-	defer s.Close()
+	ctx := setup(t, 5)
+	defer ctx.tearDown()
 
-	ns := framework.CreateTestingNamespace("gc-cascading-deletion", s, t)
-	defer framework.DeleteTestingNamespace(ns, s, t)
+	gc, clientSet := ctx.gc, ctx.clientSet
 
-	rcClient := clientSet.Core().ReplicationControllers(ns.Name)
-	podClient := clientSet.Core().Pods(ns.Name)
+	ns := createNamespaceOrDie("gc-cascading-deletion", clientSet, t)
+	defer deleteNamespaceOrDie(ns.Name, clientSet, t)
+
+	rcClient := clientSet.CoreV1().ReplicationControllers(ns.Name)
+	podClient := clientSet.CoreV1().Pods(ns.Name)
 
 	toBeDeletedRC, err := rcClient.Create(newOwnerRC(toBeDeletedRCName, ns.Name))
 	if err != nil {
@@ -215,9 +370,6 @@ func TestCascadingDeletion(t *testing.T) {
 	if len(pods.Items) != 3 {
 		t.Fatalf("Expect only 3 pods")
 	}
-	stopCh := make(chan struct{})
-	go gc.Run(5, stopCh)
-	defer close(stopCh)
 	// delete one of the replication controller
 	if err := rcClient.Delete(toBeDeletedRCName, getNonOrphanOptions()); err != nil {
 		t.Fatalf("failed to delete replication controller: %v", err)
@@ -225,12 +377,12 @@ func TestCascadingDeletion(t *testing.T) {
 	// sometimes the deletion of the RC takes long time to be observed by
 	// the gc, so wait for the garbage collector to observe the deletion of
 	// the toBeDeletedRC
-	if err := wait.Poll(10*time.Second, 60*time.Second, func() (bool, error) {
-		return !gc.GraphHasUID([]types.UID{toBeDeletedRC.ObjectMeta.UID}), nil
+	if err := wait.Poll(1*time.Second, 60*time.Second, func() (bool, error) {
+		return !gc.GraphHasUID(toBeDeletedRC.ObjectMeta.UID), nil
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := integration.WaitForPodToDisappear(podClient, garbageCollectedPodName, 5*time.Second, 30*time.Second); err != nil {
+	if err := integration.WaitForPodToDisappear(podClient, garbageCollectedPodName, 1*time.Second, 30*time.Second); err != nil {
 		t.Fatalf("expect pod %s to be garbage collected, got err= %v", garbageCollectedPodName, err)
 	}
 	// checks the garbage collect doesn't delete pods it shouldn't delete.
@@ -245,13 +397,15 @@ func TestCascadingDeletion(t *testing.T) {
 // This test simulates the case where an object is created with an owner that
 // doesn't exist. It verifies the GC will delete such an object.
 func TestCreateWithNonExistentOwner(t *testing.T) {
-	s, gc, clientSet := setup(t)
-	defer s.Close()
+	ctx := setup(t, 5)
+	defer ctx.tearDown()
 
-	ns := framework.CreateTestingNamespace("gc-non-existing-owner", s, t)
-	defer framework.DeleteTestingNamespace(ns, s, t)
+	clientSet := ctx.clientSet
 
-	podClient := clientSet.Core().Pods(ns.Name)
+	ns := createNamespaceOrDie("gc-non-existing-owner", clientSet, t)
+	defer deleteNamespaceOrDie(ns.Name, clientSet, t)
+
+	podClient := clientSet.CoreV1().Pods(ns.Name)
 
 	pod := newPod(garbageCollectedPodName, ns.Name, []metav1.OwnerReference{{UID: "doesn't matter", Name: toBeDeletedRCName}})
 	_, err := podClient.Create(pod)
@@ -264,22 +418,19 @@ func TestCreateWithNonExistentOwner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to list pods: %v", err)
 	}
-	if len(pods.Items) != 1 {
-		t.Fatalf("Expect only 1 pod")
+	if len(pods.Items) > 1 {
+		t.Fatalf("Unexpected pod list: %v", pods.Items)
 	}
-	stopCh := make(chan struct{})
-	go gc.Run(5, stopCh)
-	defer close(stopCh)
 	// wait for the garbage collector to delete the pod
-	if err := integration.WaitForPodToDisappear(podClient, garbageCollectedPodName, 5*time.Second, 30*time.Second); err != nil {
+	if err := integration.WaitForPodToDisappear(podClient, garbageCollectedPodName, 1*time.Second, 30*time.Second); err != nil {
 		t.Fatalf("expect pod %s to be garbage collected, got err= %v", garbageCollectedPodName, err)
 	}
 }
 
 func setupRCsPods(t *testing.T, gc *garbagecollector.GarbageCollector, clientSet clientset.Interface, nameSuffix, namespace string, initialFinalizers []string, options *metav1.DeleteOptions, wg *sync.WaitGroup, rcUIDs chan types.UID) {
 	defer wg.Done()
-	rcClient := clientSet.Core().ReplicationControllers(namespace)
-	podClient := clientSet.Core().Pods(namespace)
+	rcClient := clientSet.CoreV1().ReplicationControllers(namespace)
+	podClient := clientSet.CoreV1().Pods(namespace)
 	// create rc.
 	rcName := "test.rc." + nameSuffix
 	rc := newOwnerRC(rcName, namespace)
@@ -294,18 +445,42 @@ func setupRCsPods(t *testing.T, gc *garbagecollector.GarbageCollector, clientSet
 	for j := 0; j < 3; j++ {
 		podName := "test.pod." + nameSuffix + "-" + strconv.Itoa(j)
 		pod := newPod(podName, namespace, []metav1.OwnerReference{{UID: rc.ObjectMeta.UID, Name: rc.ObjectMeta.Name}})
-		_, err = podClient.Create(pod)
+		createdPod, err := podClient.Create(pod)
 		if err != nil {
 			t.Fatalf("Failed to create Pod: %v", err)
 		}
-		podUIDs = append(podUIDs, pod.ObjectMeta.UID)
+		podUIDs = append(podUIDs, createdPod.ObjectMeta.UID)
 	}
-	orphan := (options != nil && options.OrphanDependents != nil && *options.OrphanDependents) || (options == nil && len(initialFinalizers) != 0 && initialFinalizers[0] == metav1.FinalizerOrphanDependents)
+	orphan := false
+	switch {
+	case options == nil:
+		// if there are no deletion options, the default policy for replication controllers is orphan
+		orphan = true
+	case options.OrphanDependents != nil:
+		// if the deletion options explicitly specify whether to orphan, that controls
+		orphan = *options.OrphanDependents
+	case options.PropagationPolicy != nil:
+		// if the deletion options explicitly specify whether to orphan, that controls
+		orphan = *options.PropagationPolicy == metav1.DeletePropagationOrphan
+	case len(initialFinalizers) != 0 && initialFinalizers[0] == metav1.FinalizerOrphanDependents:
+		// if the orphan finalizer is explicitly added, we orphan
+		orphan = true
+	}
 	// if we intend to orphan the pods, we need wait for the gc to observe the
 	// creation of the pods, otherwise if the deletion of RC is observed before
 	// the creation of the pods, the pods will not be orphaned.
 	if orphan {
-		wait.Poll(5*time.Second, 60*time.Second, func() (bool, error) { return gc.GraphHasUID(podUIDs), nil })
+		err := wait.Poll(1*time.Second, 60*time.Second, func() (bool, error) {
+			for _, u := range podUIDs {
+				if !gc.GraphHasUID(u) {
+					return false, nil
+				}
+			}
+			return true, nil
+		})
+		if err != nil {
+			t.Fatalf("failed to observe the expected pods in the GC graph for rc %s", rcName)
+		}
 	}
 	// delete the rc
 	if err := rcClient.Delete(rc.ObjectMeta.Name, options); err != nil {
@@ -314,8 +489,8 @@ func setupRCsPods(t *testing.T, gc *garbagecollector.GarbageCollector, clientSet
 }
 
 func verifyRemainingObjects(t *testing.T, clientSet clientset.Interface, namespace string, rcNum, podNum int) (bool, error) {
-	rcClient := clientSet.Core().ReplicationControllers(namespace)
-	podClient := clientSet.Core().Pods(namespace)
+	rcClient := clientSet.CoreV1().ReplicationControllers(namespace)
+	podClient := clientSet.CoreV1().Pods(namespace)
 	pods, err := podClient.List(metav1.ListOptions{})
 	if err != nil {
 		return false, fmt.Errorf("Failed to list pods: %v", err)
@@ -340,21 +515,18 @@ func verifyRemainingObjects(t *testing.T, clientSet clientset.Interface, namespa
 // time of our pre-submit tests to increase submit-queue throughput. We'll add
 // e2e tests that put more stress.
 func TestStressingCascadingDeletion(t *testing.T) {
-	t.Logf("starts garbage collector stress test")
-	s, gc, clientSet := setup(t)
-	defer s.Close()
+	ctx := setup(t, 5)
+	defer ctx.tearDown()
 
-	ns := framework.CreateTestingNamespace("gc-stressing-cascading-deletion", s, t)
-	defer framework.DeleteTestingNamespace(ns, s, t)
+	gc, clientSet := ctx.gc, ctx.clientSet
 
-	stopCh := make(chan struct{})
-	go gc.Run(5, stopCh)
-	defer close(stopCh)
+	ns := createNamespaceOrDie("gc-stressing-cascading-deletion", clientSet, t)
+	defer deleteNamespaceOrDie(ns.Name, clientSet, t)
 
 	const collections = 10
 	var wg sync.WaitGroup
-	wg.Add(collections * 4)
-	rcUIDs := make(chan types.UID, collections*4)
+	wg.Add(collections * 5)
+	rcUIDs := make(chan types.UID, collections*5)
 	for i := 0; i < collections; i++ {
 		// rc is created with empty finalizers, deleted with nil delete options, pods will remain.
 		go setupRCsPods(t, gc, clientSet, "collection1-"+strconv.Itoa(i), ns.Name, []string{}, nil, &wg, rcUIDs)
@@ -364,14 +536,16 @@ func TestStressingCascadingDeletion(t *testing.T) {
 		go setupRCsPods(t, gc, clientSet, "collection3-"+strconv.Itoa(i), ns.Name, []string{metav1.FinalizerOrphanDependents}, getNonOrphanOptions(), &wg, rcUIDs)
 		// rc is created with empty finalizers, deleted with DeleteOptions.OrphanDependents=true, pods will remain.
 		go setupRCsPods(t, gc, clientSet, "collection4-"+strconv.Itoa(i), ns.Name, []string{}, getOrphanOptions(), &wg, rcUIDs)
+		// rc is created with empty finalizers, deleted with DeleteOptions.PropagationPolicy=Orphan, pods will remain.
+		go setupRCsPods(t, gc, clientSet, "collection5-"+strconv.Itoa(i), ns.Name, []string{}, getPropagateOrphanOptions(), &wg, rcUIDs)
 	}
 	wg.Wait()
 	t.Logf("all pods are created, all replications controllers are created then deleted")
 	// wait for the RCs and Pods to reach the expected numbers.
-	if err := wait.Poll(5*time.Second, 300*time.Second, func() (bool, error) {
+	if err := wait.Poll(1*time.Second, 300*time.Second, func() (bool, error) {
 		podsInEachCollection := 3
 		// see the comments on the calls to setupRCsPods for details
-		remainingGroups := 3
+		remainingGroups := 4
 		return verifyRemainingObjects(t, clientSet, ns.Name, 0, collections*podsInEachCollection*remainingGroups)
 	}); err != nil {
 		t.Fatal(err)
@@ -379,37 +553,37 @@ func TestStressingCascadingDeletion(t *testing.T) {
 	t.Logf("number of remaining replication controllers and pods are as expected")
 
 	// verify the remaining pods all have "orphan" in their names.
-	podClient := clientSet.Core().Pods(ns.Name)
+	podClient := clientSet.CoreV1().Pods(ns.Name)
 	pods, err := podClient.List(metav1.ListOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, pod := range pods.Items {
-		if !strings.Contains(pod.ObjectMeta.Name, "collection1-") && !strings.Contains(pod.ObjectMeta.Name, "collection2-") && !strings.Contains(pod.ObjectMeta.Name, "collection4-") {
+		if !strings.Contains(pod.ObjectMeta.Name, "collection1-") && !strings.Contains(pod.ObjectMeta.Name, "collection2-") && !strings.Contains(pod.ObjectMeta.Name, "collection4-") && !strings.Contains(pod.ObjectMeta.Name, "collection5-") {
 			t.Errorf("got unexpected remaining pod: %#v", pod)
 		}
 	}
 
 	// verify there is no node representing replication controllers in the gc's graph
-	uids := make([]types.UID, 0, collections)
 	for i := 0; i < collections; i++ {
 		uid := <-rcUIDs
-		uids = append(uids, uid)
-	}
-	if gc.GraphHasUID(uids) {
-		t.Errorf("Expect all nodes representing replication controllers are removed from the Propagator's graph")
+		if gc.GraphHasUID(uid) {
+			t.Errorf("Expect all nodes representing replication controllers are removed from the Propagator's graph")
+		}
 	}
 }
 
 func TestOrphaning(t *testing.T) {
-	s, gc, clientSet := setup(t)
-	defer s.Close()
+	ctx := setup(t, 5)
+	defer ctx.tearDown()
 
-	ns := framework.CreateTestingNamespace("gc-orphaning", s, t)
-	defer framework.DeleteTestingNamespace(ns, s, t)
+	gc, clientSet := ctx.gc, ctx.clientSet
 
-	podClient := clientSet.Core().Pods(ns.Name)
-	rcClient := clientSet.Core().ReplicationControllers(ns.Name)
+	ns := createNamespaceOrDie("gc-orphaning", clientSet, t)
+	defer deleteNamespaceOrDie(ns.Name, clientSet, t)
+
+	podClient := clientSet.CoreV1().Pods(ns.Name)
+	rcClient := clientSet.CoreV1().ReplicationControllers(ns.Name)
 	// create the RC with the orphan finalizer set
 	toBeDeletedRC := newOwnerRC(toBeDeletedRCName, ns.Name)
 	toBeDeletedRC, err := rcClient.Create(toBeDeletedRC)
@@ -423,27 +597,34 @@ func TestOrphaning(t *testing.T) {
 	for i := 0; i < podsNum; i++ {
 		podName := garbageCollectedPodName + strconv.Itoa(i)
 		pod := newPod(podName, ns.Name, []metav1.OwnerReference{{UID: toBeDeletedRC.ObjectMeta.UID, Name: toBeDeletedRCName}})
-		_, err = podClient.Create(pod)
+		createdPod, err := podClient.Create(pod)
 		if err != nil {
 			t.Fatalf("Failed to create Pod: %v", err)
 		}
-		podUIDs = append(podUIDs, pod.ObjectMeta.UID)
+		podUIDs = append(podUIDs, createdPod.ObjectMeta.UID)
 	}
-	stopCh := make(chan struct{})
-	go gc.Run(5, stopCh)
-	defer close(stopCh)
 
 	// we need wait for the gc to observe the creation of the pods, otherwise if
 	// the deletion of RC is observed before the creation of the pods, the pods
 	// will not be orphaned.
-	wait.Poll(5*time.Second, 60*time.Second, func() (bool, error) { return gc.GraphHasUID(podUIDs), nil })
+	err = wait.Poll(1*time.Second, 60*time.Second, func() (bool, error) {
+		for _, u := range podUIDs {
+			if !gc.GraphHasUID(u) {
+				return false, nil
+			}
+		}
+		return true, nil
+	})
+	if err != nil {
+		t.Fatalf("Failed to observe pods in GC graph for %s: %v", toBeDeletedRC.Name, err)
+	}
 
 	err = rcClient.Delete(toBeDeletedRCName, getOrphanOptions())
 	if err != nil {
 		t.Fatalf("Failed to gracefully delete the rc: %v", err)
 	}
 	// verify the toBeDeleteRC is deleted
-	if err := wait.PollImmediate(5*time.Second, 30*time.Second, func() (bool, error) {
+	if err := wait.PollImmediate(1*time.Second, 30*time.Second, func() (bool, error) {
 		rcs, err := rcClient.List(metav1.ListOptions{})
 		if err != nil {
 			return false, err
@@ -473,14 +654,16 @@ func TestOrphaning(t *testing.T) {
 }
 
 func TestSolidOwnerDoesNotBlockWaitingOwner(t *testing.T) {
-	s, gc, clientSet := setup(t)
-	defer s.Close()
+	ctx := setup(t, 5)
+	defer ctx.tearDown()
 
-	ns := framework.CreateTestingNamespace("gc-foreground1", s, t)
-	defer framework.DeleteTestingNamespace(ns, s, t)
+	clientSet := ctx.clientSet
 
-	podClient := clientSet.Core().Pods(ns.Name)
-	rcClient := clientSet.Core().ReplicationControllers(ns.Name)
+	ns := createNamespaceOrDie("gc-foreground1", clientSet, t)
+	defer deleteNamespaceOrDie(ns.Name, clientSet, t)
+
+	podClient := clientSet.CoreV1().Pods(ns.Name)
+	rcClient := clientSet.CoreV1().ReplicationControllers(ns.Name)
 	// create the RC with the orphan finalizer set
 	toBeDeletedRC, err := rcClient.Create(newOwnerRC(toBeDeletedRCName, ns.Name))
 	if err != nil {
@@ -500,16 +683,12 @@ func TestSolidOwnerDoesNotBlockWaitingOwner(t *testing.T) {
 		t.Fatalf("Failed to create Pod: %v", err)
 	}
 
-	stopCh := make(chan struct{})
-	go gc.Run(5, stopCh)
-	defer close(stopCh)
-
 	err = rcClient.Delete(toBeDeletedRCName, getForegroundOptions())
 	if err != nil {
 		t.Fatalf("Failed to delete the rc: %v", err)
 	}
 	// verify the toBeDeleteRC is deleted
-	if err := wait.PollImmediate(5*time.Second, 30*time.Second, func() (bool, error) {
+	if err := wait.PollImmediate(1*time.Second, 30*time.Second, func() (bool, error) {
 		_, err := rcClient.Get(toBeDeletedRC.Name, metav1.GetOptions{})
 		if err != nil {
 			if errors.IsNotFound(err) {
@@ -535,14 +714,16 @@ func TestSolidOwnerDoesNotBlockWaitingOwner(t *testing.T) {
 }
 
 func TestNonBlockingOwnerRefDoesNotBlock(t *testing.T) {
-	s, gc, clientSet := setup(t)
-	defer s.Close()
+	ctx := setup(t, 5)
+	defer ctx.tearDown()
 
-	ns := framework.CreateTestingNamespace("gc-foreground2", s, t)
-	defer framework.DeleteTestingNamespace(ns, s, t)
+	clientSet := ctx.clientSet
 
-	podClient := clientSet.Core().Pods(ns.Name)
-	rcClient := clientSet.Core().ReplicationControllers(ns.Name)
+	ns := createNamespaceOrDie("gc-foreground2", clientSet, t)
+	defer deleteNamespaceOrDie(ns.Name, clientSet, t)
+
+	podClient := clientSet.CoreV1().Pods(ns.Name)
+	rcClient := clientSet.CoreV1().ReplicationControllers(ns.Name)
 	// create the RC with the orphan finalizer set
 	toBeDeletedRC, err := rcClient.Create(newOwnerRC(toBeDeletedRCName, ns.Name))
 	if err != nil {
@@ -570,16 +751,12 @@ func TestNonBlockingOwnerRefDoesNotBlock(t *testing.T) {
 		t.Fatalf("Failed to create Pod: %v", err)
 	}
 
-	stopCh := make(chan struct{})
-	go gc.Run(5, stopCh)
-	defer close(stopCh)
-
 	err = rcClient.Delete(toBeDeletedRCName, getForegroundOptions())
 	if err != nil {
 		t.Fatalf("Failed to delete the rc: %v", err)
 	}
 	// verify the toBeDeleteRC is deleted
-	if err := wait.PollImmediate(5*time.Second, 30*time.Second, func() (bool, error) {
+	if err := wait.PollImmediate(1*time.Second, 30*time.Second, func() (bool, error) {
 		_, err := rcClient.Get(toBeDeletedRC.Name, metav1.GetOptions{})
 		if err != nil {
 			if errors.IsNotFound(err) {
@@ -603,14 +780,15 @@ func TestNonBlockingOwnerRefDoesNotBlock(t *testing.T) {
 }
 
 func TestBlockingOwnerRefDoesBlock(t *testing.T) {
-	s, gc, clientSet := setup(t)
-	defer s.Close()
+	ctx := setup(t, 0)
+	defer ctx.tearDown()
+	gc, clientSet := ctx.gc, ctx.clientSet
 
-	ns := framework.CreateTestingNamespace("gc-foreground3", s, t)
-	defer framework.DeleteTestingNamespace(ns, s, t)
+	ns := createNamespaceOrDie("foo", clientSet, t)
+	defer deleteNamespaceOrDie(ns.Name, clientSet, t)
 
-	podClient := clientSet.Core().Pods(ns.Name)
-	rcClient := clientSet.Core().ReplicationControllers(ns.Name)
+	podClient := clientSet.CoreV1().Pods(ns.Name)
+	rcClient := clientSet.CoreV1().ReplicationControllers(ns.Name)
 	// create the RC with the orphan finalizer set
 	toBeDeletedRC, err := rcClient.Create(newOwnerRC(toBeDeletedRCName, ns.Name))
 	if err != nil {
@@ -627,12 +805,9 @@ func TestBlockingOwnerRefDoesBlock(t *testing.T) {
 		t.Fatalf("Failed to create Pod: %v", err)
 	}
 
-	stopCh := make(chan struct{})
-	go gc.Run(5, stopCh)
-	defer close(stopCh)
-
 	// this makes sure the garbage collector will have added the pod to its
 	// dependency graph before handling the foreground deletion of the rc.
+	ctx.startGC(5)
 	timeout := make(chan struct{})
 	go func() {
 		select {
@@ -640,7 +815,7 @@ func TestBlockingOwnerRefDoesBlock(t *testing.T) {
 			close(timeout)
 		}
 	}()
-	if !cache.WaitForCacheSync(timeout, gc.HasSynced) {
+	if !cache.WaitForCacheSync(timeout, gc.IsSynced) {
 		t.Fatalf("failed to wait for garbage collector to be synced")
 	}
 
@@ -648,7 +823,7 @@ func TestBlockingOwnerRefDoesBlock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to delete the rc: %v", err)
 	}
-	time.Sleep(30 * time.Second)
+	time.Sleep(15 * time.Second)
 	// verify the toBeDeleteRC is NOT deleted
 	_, err = rcClient.Get(toBeDeletedRC.Name, metav1.GetOptions{})
 	if err != nil {
@@ -662,5 +837,232 @@ func TestBlockingOwnerRefDoesBlock(t *testing.T) {
 	}
 	if len(pods.Items) != 1 {
 		t.Errorf("expect there to be 1 pods, got %#v", pods.Items)
+	}
+}
+
+// TestCustomResourceCascadingDeletion ensures the basic cascading delete
+// behavior supports custom resources.
+func TestCustomResourceCascadingDeletion(t *testing.T) {
+	ctx := setup(t, 5)
+	defer ctx.tearDown()
+
+	clientSet, apiExtensionClient, dynamicClient := ctx.clientSet, ctx.apiExtensionClient, ctx.dynamicClient
+
+	ns := createNamespaceOrDie("crd-cascading", clientSet, t)
+
+	definition, resourceClient := createRandomCustomResourceDefinition(t, apiExtensionClient, dynamicClient, ns.Name)
+
+	// Create a custom owner resource.
+	owner := newCRDInstance(definition, ns.Name, names.SimpleNameGenerator.GenerateName("owner"))
+	owner, err := resourceClient.Create(owner, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("failed to create owner resource %q: %v", owner.GetName(), err)
+	}
+	t.Logf("created owner resource %q", owner.GetName())
+
+	// Create a custom dependent resource.
+	dependent := newCRDInstance(definition, ns.Name, names.SimpleNameGenerator.GenerateName("dependent"))
+	link(t, owner, dependent)
+
+	dependent, err = resourceClient.Create(dependent, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("failed to create dependent resource %q: %v", dependent.GetName(), err)
+	}
+	t.Logf("created dependent resource %q", dependent.GetName())
+
+	// Delete the owner.
+	foreground := metav1.DeletePropagationForeground
+	err = resourceClient.Delete(owner.GetName(), &metav1.DeleteOptions{PropagationPolicy: &foreground})
+	if err != nil {
+		t.Fatalf("failed to delete owner resource %q: %v", owner.GetName(), err)
+	}
+
+	// Ensure the owner is deleted.
+	if err := wait.Poll(1*time.Second, 60*time.Second, func() (bool, error) {
+		_, err := resourceClient.Get(owner.GetName(), metav1.GetOptions{})
+		return errors.IsNotFound(err), nil
+	}); err != nil {
+		t.Fatalf("failed waiting for owner resource %q to be deleted", owner.GetName())
+	}
+
+	// Ensure the dependent is deleted.
+	_, err = resourceClient.Get(dependent.GetName(), metav1.GetOptions{})
+	if err == nil {
+		t.Fatalf("expected dependent %q to be deleted", dependent.GetName())
+	} else {
+		if !errors.IsNotFound(err) {
+			t.Fatalf("unexpected error getting dependent %q: %v", dependent.GetName(), err)
+		}
+	}
+}
+
+// TestMixedRelationships ensures that owner/dependent relationships work
+// between core and custom resources.
+//
+// TODO: Consider how this could be represented with table-style tests (e.g. a
+// before/after expected object graph given a delete operation targeting a
+// specific node in the before graph with certain delete options).
+func TestMixedRelationships(t *testing.T) {
+	ctx := setup(t, 5)
+	defer ctx.tearDown()
+
+	clientSet, apiExtensionClient, dynamicClient := ctx.clientSet, ctx.apiExtensionClient, ctx.dynamicClient
+
+	ns := createNamespaceOrDie("crd-mixed", clientSet, t)
+
+	configMapClient := clientSet.CoreV1().ConfigMaps(ns.Name)
+
+	definition, resourceClient := createRandomCustomResourceDefinition(t, apiExtensionClient, dynamicClient, ns.Name)
+
+	// Create a custom owner resource.
+	customOwner, err := resourceClient.Create(newCRDInstance(definition, ns.Name, names.SimpleNameGenerator.GenerateName("owner")), metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("failed to create owner: %v", err)
+	}
+	t.Logf("created custom owner %q", customOwner.GetName())
+
+	// Create a core dependent resource.
+	coreDependent := newConfigMap(ns.Name, names.SimpleNameGenerator.GenerateName("dependent"))
+	link(t, customOwner, coreDependent)
+	coreDependent, err = configMapClient.Create(coreDependent)
+	if err != nil {
+		t.Fatalf("failed to create dependent: %v", err)
+	}
+	t.Logf("created core dependent %q", coreDependent.GetName())
+
+	// Create a core owner resource.
+	coreOwner, err := configMapClient.Create(newConfigMap(ns.Name, names.SimpleNameGenerator.GenerateName("owner")))
+	if err != nil {
+		t.Fatalf("failed to create owner: %v", err)
+	}
+	t.Logf("created core owner %q: %#v", coreOwner.GetName(), coreOwner)
+
+	// Create a custom dependent resource.
+	customDependent := newCRDInstance(definition, ns.Name, names.SimpleNameGenerator.GenerateName("dependent"))
+	coreOwner.TypeMeta.Kind = "ConfigMap"
+	coreOwner.TypeMeta.APIVersion = "v1"
+	link(t, coreOwner, customDependent)
+	customDependent, err = resourceClient.Create(customDependent, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("failed to create dependent: %v", err)
+	}
+	t.Logf("created custom dependent %q", customDependent.GetName())
+
+	// Delete the custom owner.
+	foreground := metav1.DeletePropagationForeground
+	err = resourceClient.Delete(customOwner.GetName(), &metav1.DeleteOptions{PropagationPolicy: &foreground})
+	if err != nil {
+		t.Fatalf("failed to delete owner resource %q: %v", customOwner.GetName(), err)
+	}
+
+	// Ensure the owner is deleted.
+	if err := wait.Poll(1*time.Second, 60*time.Second, func() (bool, error) {
+		_, err := resourceClient.Get(customOwner.GetName(), metav1.GetOptions{})
+		return errors.IsNotFound(err), nil
+	}); err != nil {
+		t.Fatalf("failed waiting for owner resource %q to be deleted", customOwner.GetName())
+	}
+
+	// Ensure the dependent is deleted.
+	_, err = resourceClient.Get(coreDependent.GetName(), metav1.GetOptions{})
+	if err == nil {
+		t.Fatalf("expected dependent %q to be deleted", coreDependent.GetName())
+	} else {
+		if !errors.IsNotFound(err) {
+			t.Fatalf("unexpected error getting dependent %q: %v", coreDependent.GetName(), err)
+		}
+	}
+
+	// Delete the core owner.
+	err = configMapClient.Delete(coreOwner.GetName(), &metav1.DeleteOptions{PropagationPolicy: &foreground})
+	if err != nil {
+		t.Fatalf("failed to delete owner resource %q: %v", coreOwner.GetName(), err)
+	}
+
+	// Ensure the owner is deleted.
+	if err := wait.Poll(1*time.Second, 60*time.Second, func() (bool, error) {
+		_, err := configMapClient.Get(coreOwner.GetName(), metav1.GetOptions{})
+		return errors.IsNotFound(err), nil
+	}); err != nil {
+		t.Fatalf("failed waiting for owner resource %q to be deleted", coreOwner.GetName())
+	}
+
+	// Ensure the dependent is deleted.
+	_, err = resourceClient.Get(customDependent.GetName(), metav1.GetOptions{})
+	if err == nil {
+		t.Fatalf("expected dependent %q to be deleted", customDependent.GetName())
+	} else {
+		if !errors.IsNotFound(err) {
+			t.Fatalf("unexpected error getting dependent %q: %v", customDependent.GetName(), err)
+		}
+	}
+}
+
+// TestCRDDeletionCascading ensures propagating deletion of a custom resource
+// definition with an instance that owns a core resource.
+func TestCRDDeletionCascading(t *testing.T) {
+	ctx := setup(t, 5)
+	defer ctx.tearDown()
+
+	clientSet, apiExtensionClient, dynamicClient := ctx.clientSet, ctx.apiExtensionClient, ctx.dynamicClient
+
+	ns := createNamespaceOrDie("crd-mixed", clientSet, t)
+
+	t.Logf("First pass CRD cascading deletion")
+	definition, resourceClient := createRandomCustomResourceDefinition(t, apiExtensionClient, dynamicClient, ns.Name)
+	testCRDDeletion(t, ctx, ns, definition, resourceClient)
+
+	t.Logf("Second pass CRD cascading deletion")
+	accessor := meta.NewAccessor()
+	accessor.SetResourceVersion(definition, "")
+	_, err := apiextensionstestserver.CreateNewCustomResourceDefinition(definition, apiExtensionClient, dynamicClient)
+	if err != nil {
+		t.Fatalf("failed to create CustomResourceDefinition: %v", err)
+	}
+	testCRDDeletion(t, ctx, ns, definition, resourceClient)
+}
+
+func testCRDDeletion(t *testing.T, ctx *testContext, ns *v1.Namespace, definition *apiextensionsv1beta1.CustomResourceDefinition, resourceClient dynamic.ResourceInterface) {
+	clientSet, apiExtensionClient := ctx.clientSet, ctx.apiExtensionClient
+
+	configMapClient := clientSet.CoreV1().ConfigMaps(ns.Name)
+
+	// Create a custom owner resource.
+	owner, err := resourceClient.Create(newCRDInstance(definition, ns.Name, names.SimpleNameGenerator.GenerateName("owner")), metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("failed to create owner: %v", err)
+	}
+	t.Logf("created owner %q", owner.GetName())
+
+	// Create a core dependent resource.
+	dependent := newConfigMap(ns.Name, names.SimpleNameGenerator.GenerateName("dependent"))
+	link(t, owner, dependent)
+	dependent, err = configMapClient.Create(dependent)
+	if err != nil {
+		t.Fatalf("failed to create dependent: %v", err)
+	}
+	t.Logf("created dependent %q", dependent.GetName())
+
+	time.Sleep(ctx.syncPeriod + 5*time.Second)
+
+	// Delete the definition, which should cascade to the owner and ultimately its dependents.
+	if err := apiextensionstestserver.DeleteCustomResourceDefinition(definition, apiExtensionClient); err != nil {
+		t.Fatalf("failed to delete %q: %v", definition.Name, err)
+	}
+
+	// Ensure the owner is deleted.
+	if err := wait.Poll(1*time.Second, 60*time.Second, func() (bool, error) {
+		_, err := resourceClient.Get(owner.GetName(), metav1.GetOptions{})
+		return errors.IsNotFound(err), nil
+	}); err != nil {
+		t.Fatalf("failed waiting for owner %q to be deleted", owner.GetName())
+	}
+
+	// Ensure the dependent is deleted.
+	if err := wait.Poll(1*time.Second, 60*time.Second, func() (bool, error) {
+		_, err := configMapClient.Get(dependent.GetName(), metav1.GetOptions{})
+		return errors.IsNotFound(err), nil
+	}); err != nil {
+		t.Fatalf("failed waiting for dependent %q (owned by %q) to be deleted", dependent.GetName(), owner.GetName())
 	}
 }

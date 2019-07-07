@@ -1,7 +1,5 @@
 package(default_visibility = ["//visibility:public"])
 
-licenses(["notice"])
-
 load(
     "@io_bazel_rules_go//go:def.bzl",
     "go_library",
@@ -11,8 +9,10 @@ load(
 go_test(
     name = "go_default_test",
     srcs = ["healthz_test.go"],
-    library = ":go_default_library",
-    tags = ["automanaged"],
+    embed = [":go_default_library"],
+    deps = [
+        "//staging/src/k8s.io/apimachinery/pkg/util/sets:go_default_library",
+    ],
 )
 
 go_library(
@@ -21,5 +21,24 @@ go_library(
         "doc.go",
         "healthz.go",
     ],
+    importmap = "k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/server/healthz",
+    importpath = "k8s.io/apiserver/pkg/server/healthz",
+    deps = [
+        "//staging/src/k8s.io/apimachinery/pkg/util/sets:go_default_library",
+        "//staging/src/k8s.io/apimachinery/pkg/util/wait:go_default_library",
+        "//vendor/k8s.io/klog:go_default_library",
+    ],
+)
+
+filegroup(
+    name = "package-srcs",
+    srcs = glob(["**"]),
+    tags = ["automanaged"],
+    visibility = ["//visibility:private"],
+)
+
+filegroup(
+    name = "all-srcs",
+    srcs = [":package-srcs"],
     tags = ["automanaged"],
 )

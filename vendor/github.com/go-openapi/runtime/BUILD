@@ -1,11 +1,4 @@
-package(default_visibility = ["//visibility:public"])
-
-licenses(["notice"])
-
-load(
-    "@io_bazel_rules_go//go:def.bzl",
-    "go_library",
-)
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "go_default_library",
@@ -16,7 +9,9 @@ go_library(
         "client_request.go",
         "client_response.go",
         "constants.go",
+        "csv.go",
         "discard.go",
+        "file.go",
         "headers.go",
         "interfaces.go",
         "json.go",
@@ -26,7 +21,9 @@ go_library(
         "values.go",
         "xml.go",
     ],
-    tags = ["automanaged"],
+    importmap = "k8s.io/kubernetes/vendor/github.com/go-openapi/runtime",
+    importpath = "github.com/go-openapi/runtime",
+    visibility = ["//visibility:public"],
     deps = [
         "//vendor/github.com/go-openapi/errors:go_default_library",
         "//vendor/github.com/go-openapi/strfmt:go_default_library",
@@ -45,4 +42,5 @@ filegroup(
     name = "all-srcs",
     srcs = [":package-srcs"],
     tags = ["automanaged"],
+    visibility = ["//visibility:public"],
 )

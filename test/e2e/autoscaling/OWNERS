@@ -1,8 +1,10 @@
+# See the OWNERS docs at https://go.k8s.io/owners
+
 reviewers:
-  - mwielgus
   - jszczepkowski
-  - MaciekPytel
+  - sig-autoscaling-maintainers
+  - wasylkowski
 approvers:
-  - mwielgus
   - jszczepkowski
-  - MaciekPytel
+  - sig-autoscaling-maintainers
+  - wasylkowski

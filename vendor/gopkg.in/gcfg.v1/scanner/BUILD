@@ -1,11 +1,4 @@
-package(default_visibility = ["//visibility:public"])
-
-licenses(["notice"])
-
-load(
-    "@io_bazel_rules_go//go:def.bzl",
-    "go_library",
-)
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "go_default_library",
@@ -13,7 +6,9 @@ go_library(
         "errors.go",
         "scanner.go",
     ],
-    tags = ["automanaged"],
+    importmap = "k8s.io/kubernetes/vendor/gopkg.in/gcfg.v1/scanner",
+    importpath = "gopkg.in/gcfg.v1/scanner",
+    visibility = ["//visibility:public"],
     deps = ["//vendor/gopkg.in/gcfg.v1/token:go_default_library"],
 )
 
@@ -28,4 +23,5 @@ filegroup(
     name = "all-srcs",
     srcs = [":package-srcs"],
     tags = ["automanaged"],
+    visibility = ["//visibility:public"],
 )

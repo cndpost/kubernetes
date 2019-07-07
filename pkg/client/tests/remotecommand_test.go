@@ -36,9 +36,10 @@ import (
 	"k8s.io/apimachinery/pkg/util/httpstream"
 	remotecommandconsts "k8s.io/apimachinery/pkg/util/remotecommand"
 	restclient "k8s.io/client-go/rest"
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/testapi"
-	remoteclient "k8s.io/kubernetes/pkg/client/unversioned/remotecommand"
+	remoteclient "k8s.io/client-go/tools/remotecommand"
+	"k8s.io/client-go/transport/spdy"
+	"k8s.io/kubernetes/pkg/api/legacyscheme"
+	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/kubelet/server/remotecommand"
 )
 
@@ -107,7 +108,7 @@ func (ex *fakeExecutor) run(name string, uid types.UID, container string, cmd []
 	return nil
 }
 
-func fakeServer(t *testing.T, testName string, exec bool, stdinData, stdoutData, stderrData, errorData string, tty bool, messageCount int, serverProtocols []string) http.HandlerFunc {
+func fakeServer(t *testing.T, requestReceived chan struct{}, testName string, exec bool, stdinData, stdoutData, stderrData, errorData string, tty bool, messageCount int, serverProtocols []string) http.HandlerFunc {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		executor := &fakeExecutor{
 			t:            t,
@@ -124,7 +125,7 @@ func fakeServer(t *testing.T, testName string, exec bool, stdinData, stdoutData,
 		opts, err := remotecommand.NewOptions(req)
 		require.NoError(t, err)
 		if exec {
-			cmd := req.URL.Query()[api.ExecCommandParamm]
+			cmd := req.URL.Query()[api.ExecCommandParam]
 			remotecommand.ServeExec(w, req, executor, "pod", "uid", "container", cmd, opts, 0, 10*time.Second, serverProtocols)
 		} else {
 			remotecommand.ServeAttach(w, req, executor, "pod", "uid", "container", opts, 0, 10*time.Second, serverProtocols)
@@ -133,6 +134,7 @@ func fakeServer(t *testing.T, testName string, exec bool, stdinData, stdoutData,
 		if e, a := strings.Repeat(stdinData, messageCount), executor.stdinReceived.String(); e != a {
 			t.Errorf("%s: stdin: expected %q, got %q", testName, e, a)
 		}
+		close(requestReceived)
 	})
 }
 
@@ -161,6 +163,15 @@ func TestStream(t *testing.T) {
 			Stdout:          "b",
 			Stderr:          "c",
 			MessageCount:    100,
+			ClientProtocols: []string{remotecommandconsts.StreamProtocolV2Name},
+			ServerProtocols: []string{remotecommandconsts.StreamProtocolV2Name},
+		},
+		{
+			TestName:        "oversized stdin",
+			Stdin:           strings.Repeat("a", 20*1024*1024),
+			Stdout:          "b",
+			Stderr:          "",
+			MessageCount:    1,
 			ClientProtocols: []string{remotecommandconsts.StreamProtocolV2Name},
 			ServerProtocols: []string{remotecommandconsts.StreamProtocolV2Name},
 		},
@@ -217,12 +228,13 @@ func TestStream(t *testing.T) {
 			localOut := &bytes.Buffer{}
 			localErr := &bytes.Buffer{}
 
-			server := httptest.NewServer(fakeServer(t, name, exec, testCase.Stdin, testCase.Stdout, testCase.Stderr, testCase.Error, testCase.Tty, testCase.MessageCount, testCase.ServerProtocols))
+			requestReceived := make(chan struct{})
+			server := httptest.NewServer(fakeServer(t, requestReceived, name, exec, testCase.Stdin, testCase.Stdout, testCase.Stderr, testCase.Error, testCase.Tty, testCase.MessageCount, testCase.ServerProtocols))
 
 			url, _ := url.ParseRequestURI(server.URL)
 			config := restclient.ContentConfig{
 				GroupVersion:         &schema.GroupVersion{Group: "x"},
-				NegotiatedSerializer: testapi.Default.NegotiatedSerializer(),
+				NegotiatedSerializer: legacyscheme.Codecs,
 			}
 			c, err := restclient.NewRESTClient(url, "", config, -1, -1, nil, nil)
 			if err != nil {
@@ -255,17 +267,21 @@ func TestStream(t *testing.T) {
 			conf := &restclient.Config{
 				Host: server.URL,
 			}
-			e, err := remoteclient.NewExecutor(conf, "POST", req.URL())
+			transport, upgradeTransport, err := spdy.RoundTripperFor(conf)
+			if err != nil {
+				t.Errorf("%s: unexpected error: %v", name, err)
+				continue
+			}
+			e, err := remoteclient.NewSPDYExecutorForProtocols(transport, upgradeTransport, "POST", req.URL(), testCase.ClientProtocols...)
 			if err != nil {
 				t.Errorf("%s: unexpected error: %v", name, err)
 				continue
 			}
 			err = e.Stream(remoteclient.StreamOptions{
-				SupportedProtocols: testCase.ClientProtocols,
-				Stdin:              streamIn,
-				Stdout:             streamOut,
-				Stderr:             streamErr,
-				Tty:                testCase.Tty,
+				Stdin:  streamIn,
+				Stdout: streamOut,
+				Stderr: streamErr,
+				Tty:    testCase.Tty,
 			})
 			hasErr := err != nil
 
@@ -300,6 +316,12 @@ func TestStream(t *testing.T) {
 				}
 			}
 
+			select {
+			case <-requestReceived:
+			case <-time.After(time.Minute):
+				t.Errorf("%s: expected fakeServerInstance to receive request", name)
+			}
+
 			server.Close()
 		}
 	}
@@ -311,11 +333,13 @@ type fakeUpgrader struct {
 	conn          httpstream.Connection
 	err, connErr  error
 	checkResponse bool
+	called        bool
 
 	t *testing.T
 }
 
 func (u *fakeUpgrader) RoundTrip(req *http.Request) (*http.Response, error) {
+	u.called = true
 	u.req = req
 	return u.resp, u.err
 }
@@ -344,27 +368,16 @@ func TestDial(t *testing.T) {
 			Body:       ioutil.NopCloser(&bytes.Buffer{}),
 		},
 	}
-	var called bool
-	testFn := func(rt http.RoundTripper) http.RoundTripper {
-		if rt != upgrader {
-			t.Fatalf("unexpected round tripper: %#v", rt)
-		}
-		called = true
-		return rt
-	}
-	exec, err := remoteclient.NewStreamExecutor(upgrader, testFn, "POST", &url.URL{Host: "something.com", Scheme: "https"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	conn, protocol, err := exec.Dial("protocol1")
+	dialer := spdy.NewDialer(upgrader, &http.Client{Transport: upgrader}, "POST", &url.URL{Host: "something.com", Scheme: "https"})
+	conn, protocol, err := dialer.Dial("protocol1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if conn != upgrader.conn {
 		t.Errorf("unexpected connection: %#v", conn)
 	}
-	if !called {
-		t.Errorf("wrapper not called")
+	if !upgrader.called {
+		t.Errorf("request not called")
 	}
 	_ = protocol
 }

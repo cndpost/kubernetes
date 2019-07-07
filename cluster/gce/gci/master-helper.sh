@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Copyright 2016 The Kubernetes Authors.
 #
@@ -62,12 +62,28 @@ function replicate-master-instance() {
   kube_env="$(echo "${kube_env}" | grep -v "ETCD_PEER_CERT")"
   kube_env="$(echo -e "${kube_env}\nETCD_PEER_CERT: '${ETCD_PEER_CERT_BASE64}'")"
 
+  local master_certs="$(get-metadata "${existing_master_zone}" "${existing_master_name}" kube-master-certs)"
+
+  ETCD_APISERVER_CA_KEY="$(echo "${master_certs}" | grep "ETCD_APISERVER_CA_KEY" |  sed "s/^.*: '//" | sed "s/'$//")"
+  ETCD_APISERVER_CA_CERT="$(echo "${master_certs}" | grep "ETCD_APISERVER_CA_CERT" |  sed "s/^.*: '//" | sed "s/'$//")"
+  create-etcd-apiserver-certs "etcd-${REPLICA_NAME}" "${REPLICA_NAME}" "${ETCD_APISERVER_CA_CERT}" "${ETCD_APISERVER_CA_KEY}"
+
+  master_certs="$(echo "${master_certs}" | grep -v "ETCD_APISERVER_SERVER_KEY")"
+  master_certs="$(echo -e "${master_certs}\nETCD_APISERVER_SERVER_KEY: '${ETCD_APISERVER_SERVER_KEY_BASE64}'")"
+  master_certs="$(echo "${master_certs}" | grep -v "ETCD_APISERVER_SERVER_CERT")"
+  master_certs="$(echo -e "${master_certs}\nETCD_APISERVER_SERVER_CERT: '${ETCD_APISERVER_SERVER_CERT_BASE64}'")"
+  master_certs="$(echo "${master_certs}" | grep -v "ETCD_APISERVER_CLIENT_KEY")"
+  master_certs="$(echo -e "${master_certs}\nETCD_APISERVER_CLIENT_KEY: '${ETCD_APISERVER_CLIENT_KEY_BASE64}'")"
+  master_certs="$(echo "${master_certs}" | grep -v "ETCD_APISERVER_CLIENT_CERT")"
+  master_certs="$(echo -e "${master_certs}\nETCD_APISERVER_CLIENT_CERT: '${ETCD_APISERVER_CLIENT_CERT_BASE64}'")"
+
   echo "${kube_env}" > ${KUBE_TEMP}/master-kube-env.yaml
+  echo "${master_certs}" > ${KUBE_TEMP}/kube-master-certs.yaml
   get-metadata "${existing_master_zone}" "${existing_master_name}" cluster-name > "${KUBE_TEMP}/cluster-name.txt"
   get-metadata "${existing_master_zone}" "${existing_master_name}" gci-update-strategy > "${KUBE_TEMP}/gci-update.txt"
   get-metadata "${existing_master_zone}" "${existing_master_name}" gci-ensure-gke-docker > "${KUBE_TEMP}/gci-ensure-gke-docker.txt"
   get-metadata "${existing_master_zone}" "${existing_master_name}" gci-docker-version > "${KUBE_TEMP}/gci-docker-version.txt"
-  get-metadata "${existing_master_zone}" "${existing_master_name}" kube-master-certs > "${KUBE_TEMP}/kube-master-certs.yaml"
+  get-metadata "${existing_master_zone}" "${existing_master_name}" cluster-location > "${KUBE_TEMP}/cluster-location.txt"
 
   create-master-instance-internal "${REPLICA_NAME}"
 }
@@ -75,8 +91,12 @@ function replicate-master-instance() {
 
 function create-master-instance-internal() {
   local gcloud="gcloud"
-  if [[ "${ENABLE_IP_ALIASES:-}" == 'true' ]]; then
-    gcloud="gcloud alpha"
+  local retries=5
+  local sleep_sec=10
+  if [[ "${MASTER_SIZE##*-}" -ge 64 ]]; then  # remove everything up to last dash (inclusive)
+    # Workaround for #55777
+    retries=30
+    sleep_sec=60
   fi
 
   local -r master_name="${1}"
@@ -87,18 +107,29 @@ function create-master-instance-internal() {
     preemptible_master="--preemptible --maintenance-policy TERMINATE"
   fi
 
+  local enable_ip_aliases
+  if [[ "${NODE_IPAM_MODE:-}" == "CloudAllocator" ]]; then
+    enable_ip_aliases=true
+  else
+    enable_ip_aliases=false
+  fi
+
   local network=$(make-gcloud-network-argument \
-    "${NETWORK}" "${address:-}" \
-    "${ENABLE_IP_ALIASES:-}" "${IP_ALIAS_SUBNETWORK:-}" "${IP_ALIAS_SIZE:-}")
+    "${NETWORK_PROJECT}" "${REGION}" "${NETWORK}" "${SUBNETWORK:-}" \
+    "${address:-}" "${enable_ip_aliases:-}" "${IP_ALIAS_SIZE:-}")
 
   local metadata="kube-env=${KUBE_TEMP}/master-kube-env.yaml"
+  metadata="${metadata},kubelet-config=${KUBE_TEMP}/master-kubelet-config.yaml"
   metadata="${metadata},user-data=${KUBE_ROOT}/cluster/gce/gci/master.yaml"
   metadata="${metadata},configure-sh=${KUBE_ROOT}/cluster/gce/gci/configure.sh"
+  metadata="${metadata},cluster-location=${KUBE_TEMP}/cluster-location.txt"
   metadata="${metadata},cluster-name=${KUBE_TEMP}/cluster-name.txt"
   metadata="${metadata},gci-update-strategy=${KUBE_TEMP}/gci-update.txt"
   metadata="${metadata},gci-ensure-gke-docker=${KUBE_TEMP}/gci-ensure-gke-docker.txt"
   metadata="${metadata},gci-docker-version=${KUBE_TEMP}/gci-docker-version.txt"
   metadata="${metadata},kube-master-certs=${KUBE_TEMP}/kube-master-certs.yaml"
+  metadata="${metadata},cluster-location=${KUBE_TEMP}/cluster-location.txt"
+  metadata="${metadata},${MASTER_EXTRA_METADATA}"
 
   local disk="name=${master_name}-pd"
   disk="${disk},device-name=master-pd"
@@ -106,19 +137,35 @@ function create-master-instance-internal() {
   disk="${disk},boot=no"
   disk="${disk},auto-delete=no"
 
-  ${gcloud} compute instances create "${master_name}" \
-    --project "${PROJECT}" \
-    --zone "${ZONE}" \
-    --machine-type "${MASTER_SIZE}" \
-    --image-project="${MASTER_IMAGE_PROJECT}" \
-    --image "${MASTER_IMAGE}" \
-    --tags "${MASTER_TAG}" \
-    --scopes "storage-ro,compute-rw,monitoring,logging-write" \
-    --metadata-from-file "${metadata}" \
-    --disk "${disk}" \
-    --boot-disk-size "${MASTER_ROOT_DISK_SIZE:-10}" \
-    ${preemptible_master} \
-    ${network}
+  for attempt in $(seq 1 ${retries}); do
+    if result=$(${gcloud} compute instances create "${master_name}" \
+      --project "${PROJECT}" \
+      --zone "${ZONE}" \
+      --machine-type "${MASTER_SIZE}" \
+      --image-project="${MASTER_IMAGE_PROJECT}" \
+      --image "${MASTER_IMAGE}" \
+      --tags "${MASTER_TAG}" \
+      --scopes "storage-ro,compute-rw,monitoring,logging-write" \
+      --metadata-from-file "${metadata}" \
+      --disk "${disk}" \
+      --boot-disk-size "${MASTER_ROOT_DISK_SIZE}" \
+      ${MASTER_MIN_CPU_ARCHITECTURE:+"--min-cpu-platform=${MASTER_MIN_CPU_ARCHITECTURE}"} \
+      ${preemptible_master} \
+      ${network} 2>&1); then
+      echo "${result}" >&2
+      return 0
+    else
+      echo "${result}" >&2
+      if [[ ! "${result}" =~ "try again later" ]]; then
+        echo "Failed to create master instance due to non-retryable error" >&2
+        return 1
+      fi
+      sleep $sleep_sec
+    fi
+  done
+
+  echo "Failed to create master instance despite ${retries} attempts" >&2
+  return 1
 }
 
 function get-metadata() {

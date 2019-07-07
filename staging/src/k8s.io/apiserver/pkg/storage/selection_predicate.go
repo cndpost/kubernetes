@@ -17,28 +17,74 @@ limitations under the License.
 package storage
 
 import (
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// AttrFunc returns label and field sets for List or Watch to match.
+// AttrFunc returns label and field sets and the uninitialized flag for List or Watch to match.
 // In any failure to parse given object, it returns error.
 type AttrFunc func(obj runtime.Object) (labels.Set, fields.Set, error)
 
+// FieldMutationFunc allows the mutation of the field selection fields.  It is mutating to
+// avoid the extra allocation on this common path
+type FieldMutationFunc func(obj runtime.Object, fieldSet fields.Set) error
+
+func DefaultClusterScopedAttr(obj runtime.Object) (labels.Set, fields.Set, error) {
+	metadata, err := meta.Accessor(obj)
+	if err != nil {
+		return nil, nil, err
+	}
+	fieldSet := fields.Set{
+		"metadata.name": metadata.GetName(),
+	}
+
+	return labels.Set(metadata.GetLabels()), fieldSet, nil
+}
+
+func DefaultNamespaceScopedAttr(obj runtime.Object) (labels.Set, fields.Set, error) {
+	metadata, err := meta.Accessor(obj)
+	if err != nil {
+		return nil, nil, err
+	}
+	fieldSet := fields.Set{
+		"metadata.name":      metadata.GetName(),
+		"metadata.namespace": metadata.GetNamespace(),
+	}
+
+	return labels.Set(metadata.GetLabels()), fieldSet, nil
+}
+
+func (f AttrFunc) WithFieldMutation(fieldMutator FieldMutationFunc) AttrFunc {
+	return func(obj runtime.Object) (labels.Set, fields.Set, error) {
+		labelSet, fieldSet, err := f(obj)
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := fieldMutator(obj, fieldSet); err != nil {
+			return nil, nil, err
+		}
+		return labelSet, fieldSet, nil
+	}
+}
+
 // SelectionPredicate is used to represent the way to select objects from api storage.
 type SelectionPredicate struct {
-	Label       labels.Selector
-	Field       fields.Selector
-	GetAttrs    AttrFunc
-	IndexFields []string
+	Label               labels.Selector
+	Field               fields.Selector
+	GetAttrs            AttrFunc
+	IndexFields         []string
+	Limit               int64
+	Continue            string
+	AllowWatchBookmarks bool
 }
 
 // Matches returns true if the given object's labels and fields (as
 // returned by s.GetAttrs) match s.Label and s.Field. An error is
 // returned if s.GetAttrs fails.
 func (s *SelectionPredicate) Matches(obj runtime.Object) (bool, error) {
-	if s.Label.Empty() && s.Field.Empty() {
+	if s.Empty() {
 		return true, nil
 	}
 	labels, fields, err := s.GetAttrs(obj)
@@ -47,14 +93,14 @@ func (s *SelectionPredicate) Matches(obj runtime.Object) (bool, error) {
 	}
 	matched := s.Label.Matches(labels)
 	if matched && s.Field != nil {
-		matched = (matched && s.Field.Matches(fields))
+		matched = matched && s.Field.Matches(fields)
 	}
 	return matched, nil
 }
 
-// MatchesLabelsAndFields returns true if the given labels and fields
+// MatchesObjectAttributes returns true if the given labels and fields
 // match s.Label and s.Field.
-func (s *SelectionPredicate) MatchesLabelsAndFields(l labels.Set, f fields.Set) bool {
+func (s *SelectionPredicate) MatchesObjectAttributes(l labels.Set, f fields.Set) bool {
 	if s.Label.Empty() && s.Field.Empty() {
 		return true
 	}
@@ -68,6 +114,9 @@ func (s *SelectionPredicate) MatchesLabelsAndFields(l labels.Set, f fields.Set) 
 // MatchesSingle will return (name, true) if and only if s.Field matches on the object's
 // name.
 func (s *SelectionPredicate) MatchesSingle() (string, bool) {
+	if len(s.Continue) > 0 {
+		return "", false
+	}
 	// TODO: should be namespace.name
 	if name, ok := s.Field.RequiresExactMatch("metadata.name"); ok {
 		return name, true
@@ -87,4 +136,9 @@ func (s *SelectionPredicate) MatcherIndex() []MatchValue {
 		}
 	}
 	return result
+}
+
+// Empty returns true if the predicate performs no filtering.
+func (s *SelectionPredicate) Empty() bool {
+	return s.Label.Empty() && s.Field.Empty()
 }

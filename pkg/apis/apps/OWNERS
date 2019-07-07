@@ -1,16 +1,16 @@
+# See the OWNERS docs at https://go.k8s.io/owners
+
 reviewers:
 - thockin
 - lavalamp
 - smarterclayton
 - deads2k
 - caesarxuchao
-- bprashanth
 - pmorie
 - sttts
 - saad-ali
 - ncdc
-- timstclair
-- timothysc
+- tallclair
 - dims
 - errordeveloper
 - mml
@@ -19,3 +19,5 @@ reviewers:
 - david-mcmahon
 - kevin-wangzefeng
 - jianhuiz
+labels:
+- sig/apps

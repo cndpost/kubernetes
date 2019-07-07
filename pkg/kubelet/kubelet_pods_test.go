@@ -17,104 +17,231 @@ limitations under the License.
 package kubelet
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
-	"net"
+	"io/ioutil"
+	"os"
+	"path/filepath"
 	"sort"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	core "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/record"
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/v1"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+
+	// TODO: remove this import if
+	// api.Registry.GroupOrDie(v1.GroupName).GroupVersions[0].String() is changed
+	// to "v1"?
+
+	_ "k8s.io/kubernetes/pkg/apis/core/install"
+	"k8s.io/kubernetes/pkg/features"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	containertest "k8s.io/kubernetes/pkg/kubelet/container/testing"
 	"k8s.io/kubernetes/pkg/kubelet/server/portforward"
 	"k8s.io/kubernetes/pkg/kubelet/server/remotecommand"
+	"k8s.io/kubernetes/pkg/util/mount"
+	"k8s.io/kubernetes/pkg/volume/util/subpath"
 )
 
-func TestMakeMounts(t *testing.T) {
-	container := v1.Container{
-		VolumeMounts: []v1.VolumeMount{
-			{
-				MountPath: "/etc/hosts",
-				Name:      "disk",
-				ReadOnly:  false,
-			},
-			{
-				MountPath: "/mnt/path3",
-				Name:      "disk",
-				ReadOnly:  true,
-			},
-			{
-				MountPath: "/mnt/path4",
-				Name:      "disk4",
-				ReadOnly:  false,
-			},
-			{
-				MountPath: "/mnt/path5",
-				Name:      "disk5",
-				ReadOnly:  false,
-			},
-		},
-	}
-
-	podVolumes := kubecontainer.VolumeMap{
-		"disk":  kubecontainer.VolumeInfo{Mounter: &stubVolume{path: "/mnt/disk"}},
-		"disk4": kubecontainer.VolumeInfo{Mounter: &stubVolume{path: "/mnt/host"}},
-		"disk5": kubecontainer.VolumeInfo{Mounter: &stubVolume{path: "/var/lib/kubelet/podID/volumes/empty/disk5"}},
-	}
-
+func TestDisabledSubpath(t *testing.T) {
+	fhu := &mount.FakeHostUtil{}
+	fsp := &subpath.FakeSubpath{}
 	pod := v1.Pod{
 		Spec: v1.PodSpec{
 			HostNetwork: true,
 		},
 	}
+	podVolumes := kubecontainer.VolumeMap{
+		"disk": kubecontainer.VolumeInfo{Mounter: &stubVolume{path: "/mnt/disk"}},
+	}
 
-	mounts, _ := makeMounts(&pod, "/pod", &container, "fakepodname", "", "", podVolumes)
-
-	expectedMounts := []kubecontainer.Mount{
-		{
-			Name:           "disk",
-			ContainerPath:  "/etc/hosts",
-			HostPath:       "/mnt/disk",
-			ReadOnly:       false,
-			SELinuxRelabel: false,
+	cases := map[string]struct {
+		container   v1.Container
+		expectError bool
+	}{
+		"subpath not specified": {
+			v1.Container{
+				VolumeMounts: []v1.VolumeMount{
+					{
+						MountPath: "/mnt/path3",
+						Name:      "disk",
+						ReadOnly:  true,
+					},
+				},
+			},
+			false,
 		},
-		{
-			Name:           "disk",
-			ContainerPath:  "/mnt/path3",
-			HostPath:       "/mnt/disk",
-			ReadOnly:       true,
-			SELinuxRelabel: false,
-		},
-		{
-			Name:           "disk4",
-			ContainerPath:  "/mnt/path4",
-			HostPath:       "/mnt/host",
-			ReadOnly:       false,
-			SELinuxRelabel: false,
-		},
-		{
-			Name:           "disk5",
-			ContainerPath:  "/mnt/path5",
-			HostPath:       "/var/lib/kubelet/podID/volumes/empty/disk5",
-			ReadOnly:       false,
-			SELinuxRelabel: false,
+		"subpath specified": {
+			v1.Container{
+				VolumeMounts: []v1.VolumeMount{
+					{
+						MountPath: "/mnt/path3",
+						SubPath:   "/must/not/be/absolute",
+						Name:      "disk",
+						ReadOnly:  true,
+					},
+				},
+			},
+			true,
 		},
 	}
-	assert.Equal(t, expectedMounts, mounts, "mounts of container %+v", container)
+
+	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.VolumeSubpath, false)()
+	for name, test := range cases {
+		_, _, err := makeMounts(&pod, "/pod", &test.container, "fakepodname", "", "", podVolumes, fhu, fsp, nil)
+		if err != nil && !test.expectError {
+			t.Errorf("test %v failed: %v", name, err)
+		}
+		if err == nil && test.expectError {
+			t.Errorf("test %v failed: expected error", name)
+		}
+	}
 }
 
-func TestHostsFileContent(t *testing.T) {
+func TestNodeHostsFileContent(t *testing.T) {
+	testCases := []struct {
+		hostsFileName            string
+		hostAliases              []v1.HostAlias
+		rawHostsFileContent      string
+		expectedHostsFileContent string
+	}{
+		{
+			"hosts_test_file1",
+			[]v1.HostAlias{},
+			`# hosts file for testing.
+127.0.0.1	localhost
+::1	localhost ip6-localhost ip6-loopback
+fe00::0	ip6-localnet
+fe00::0	ip6-mcastprefix
+fe00::1	ip6-allnodes
+fe00::2	ip6-allrouters
+123.45.67.89	some.domain
+`,
+			`# Kubernetes-managed hosts file (host network).
+# hosts file for testing.
+127.0.0.1	localhost
+::1	localhost ip6-localhost ip6-loopback
+fe00::0	ip6-localnet
+fe00::0	ip6-mcastprefix
+fe00::1	ip6-allnodes
+fe00::2	ip6-allrouters
+123.45.67.89	some.domain
+`,
+		},
+		{
+			"hosts_test_file2",
+			[]v1.HostAlias{},
+			`# another hosts file for testing.
+127.0.0.1	localhost
+::1	localhost ip6-localhost ip6-loopback
+fe00::0	ip6-localnet
+fe00::0	ip6-mcastprefix
+fe00::1	ip6-allnodes
+fe00::2	ip6-allrouters
+12.34.56.78	another.domain
+`,
+			`# Kubernetes-managed hosts file (host network).
+# another hosts file for testing.
+127.0.0.1	localhost
+::1	localhost ip6-localhost ip6-loopback
+fe00::0	ip6-localnet
+fe00::0	ip6-mcastprefix
+fe00::1	ip6-allnodes
+fe00::2	ip6-allrouters
+12.34.56.78	another.domain
+`,
+		},
+		{
+			"hosts_test_file1_with_host_aliases",
+			[]v1.HostAlias{
+				{IP: "123.45.67.89", Hostnames: []string{"foo", "bar", "baz"}},
+			},
+			`# hosts file for testing.
+127.0.0.1	localhost
+::1	localhost ip6-localhost ip6-loopback
+fe00::0	ip6-localnet
+fe00::0	ip6-mcastprefix
+fe00::1	ip6-allnodes
+fe00::2	ip6-allrouters
+123.45.67.89	some.domain
+`,
+			`# Kubernetes-managed hosts file (host network).
+# hosts file for testing.
+127.0.0.1	localhost
+::1	localhost ip6-localhost ip6-loopback
+fe00::0	ip6-localnet
+fe00::0	ip6-mcastprefix
+fe00::1	ip6-allnodes
+fe00::2	ip6-allrouters
+123.45.67.89	some.domain
+
+# Entries added by HostAliases.
+123.45.67.89	foo	bar	baz
+`,
+		},
+		{
+			"hosts_test_file2_with_host_aliases",
+			[]v1.HostAlias{
+				{IP: "123.45.67.89", Hostnames: []string{"foo", "bar", "baz"}},
+				{IP: "456.78.90.123", Hostnames: []string{"park", "doo", "boo"}},
+			},
+			`# another hosts file for testing.
+127.0.0.1	localhost
+::1	localhost ip6-localhost ip6-loopback
+fe00::0	ip6-localnet
+fe00::0	ip6-mcastprefix
+fe00::1	ip6-allnodes
+fe00::2	ip6-allrouters
+12.34.56.78	another.domain
+`,
+			`# Kubernetes-managed hosts file (host network).
+# another hosts file for testing.
+127.0.0.1	localhost
+::1	localhost ip6-localhost ip6-loopback
+fe00::0	ip6-localnet
+fe00::0	ip6-mcastprefix
+fe00::1	ip6-allnodes
+fe00::2	ip6-allrouters
+12.34.56.78	another.domain
+
+# Entries added by HostAliases.
+123.45.67.89	foo	bar	baz
+456.78.90.123	park	doo	boo
+`,
+		},
+	}
+
+	for _, testCase := range testCases {
+		tmpdir, err := writeHostsFile(testCase.hostsFileName, testCase.rawHostsFileContent)
+		require.NoError(t, err, "could not create a temp hosts file")
+		defer os.RemoveAll(tmpdir)
+
+		actualContent, fileReadErr := nodeHostsFileContent(filepath.Join(tmpdir, testCase.hostsFileName), testCase.hostAliases)
+		require.NoError(t, fileReadErr, "could not create read hosts file")
+		assert.Equal(t, testCase.expectedHostsFileContent, string(actualContent), "hosts file content not expected")
+	}
+}
+
+// writeHostsFile will write a hosts file into a temporary dir, and return that dir.
+// Caller is responsible for deleting the dir and its contents.
+func writeHostsFile(filename string, cfg string) (string, error) {
+	tmpdir, err := ioutil.TempDir("", "kubelet=kubelet_pods_test.go=")
+	if err != nil {
+		return "", err
+	}
+	return tmpdir, ioutil.WriteFile(filepath.Join(tmpdir, filename), []byte(cfg), 0644)
+}
+
+func TestManagedHostsFileContent(t *testing.T) {
 	testCases := []struct {
 		hostIP          string
 		hostName        string
@@ -167,9 +294,9 @@ fe00::0	ip6-mcastprefix
 fe00::1	ip6-allnodes
 fe00::2	ip6-allrouters
 203.0.113.1	podFoo.domainFoo	podFoo
-123.45.67.89	foo
-123.45.67.89	bar
-123.45.67.89	baz
+
+# Entries added by HostAliases.
+123.45.67.89	foo	bar	baz
 `,
 		},
 		{
@@ -188,19 +315,17 @@ fe00::0	ip6-mcastprefix
 fe00::1	ip6-allnodes
 fe00::2	ip6-allrouters
 203.0.113.1	podFoo.domainFoo	podFoo
-123.45.67.89	foo
-123.45.67.89	bar
-123.45.67.89	baz
-456.78.90.123	park
-456.78.90.123	doo
-456.78.90.123	boo
+
+# Entries added by HostAliases.
+123.45.67.89	foo	bar	baz
+456.78.90.123	park	doo	boo
 `,
 		},
 	}
 
 	for _, testCase := range testCases {
-		actualContent := string(hostsFileContent(testCase.hostIP, testCase.hostName, testCase.hostDomainName, testCase.hostAliases))
-		assert.Equal(t, testCase.expectedContent, actualContent, "hosts file content not expected")
+		actualContent := managedHostsFileContent(testCase.hostIP, testCase.hostName, testCase.hostDomainName, testCase.hostAliases)
+		assert.Equal(t, testCase.expectedContent, string(actualContent), "hosts file content not expected")
 	}
 }
 
@@ -258,90 +383,6 @@ func TestRunInContainer(t *testing.T) {
 	}
 }
 
-func TestGenerateRunContainerOptions_DNSConfigurationParams(t *testing.T) {
-	testKubelet := newTestKubelet(t, false /* controllerAttachDetachEnabled */)
-	defer testKubelet.Cleanup()
-	kubelet := testKubelet.kubelet
-
-	clusterNS := "203.0.113.1"
-	kubelet.clusterDomain = "kubernetes.io"
-	kubelet.clusterDNS = []net.IP{net.ParseIP(clusterNS)}
-
-	pods := newTestPods(4)
-	pods[0].Spec.DNSPolicy = v1.DNSClusterFirstWithHostNet
-	pods[1].Spec.DNSPolicy = v1.DNSClusterFirst
-	pods[2].Spec.DNSPolicy = v1.DNSClusterFirst
-	pods[2].Spec.HostNetwork = false
-	pods[3].Spec.DNSPolicy = v1.DNSDefault
-
-	options := make([]*kubecontainer.RunContainerOptions, 4)
-	for i, pod := range pods {
-		var err error
-		options[i], _, err = kubelet.GenerateRunContainerOptions(pod, &v1.Container{}, "")
-		if err != nil {
-			t.Fatalf("failed to generate container options: %v", err)
-		}
-	}
-	if len(options[0].DNS) != 1 || options[0].DNS[0] != clusterNS {
-		t.Errorf("expected nameserver %s, got %+v", clusterNS, options[0].DNS)
-	}
-	if len(options[0].DNSSearch) == 0 || options[0].DNSSearch[0] != ".svc."+kubelet.clusterDomain {
-		t.Errorf("expected search %s, got %+v", ".svc."+kubelet.clusterDomain, options[0].DNSSearch)
-	}
-	if len(options[1].DNS) != 1 || options[1].DNS[0] != "127.0.0.1" {
-		t.Errorf("expected nameserver 127.0.0.1, got %+v", options[1].DNS)
-	}
-	if len(options[1].DNSSearch) != 1 || options[1].DNSSearch[0] != "." {
-		t.Errorf("expected search \".\", got %+v", options[1].DNSSearch)
-	}
-	if len(options[2].DNS) != 1 || options[2].DNS[0] != clusterNS {
-		t.Errorf("expected nameserver %s, got %+v", clusterNS, options[2].DNS)
-	}
-	if len(options[2].DNSSearch) == 0 || options[2].DNSSearch[0] != ".svc."+kubelet.clusterDomain {
-		t.Errorf("expected search %s, got %+v", ".svc."+kubelet.clusterDomain, options[2].DNSSearch)
-	}
-	if len(options[3].DNS) != 1 || options[3].DNS[0] != "127.0.0.1" {
-		t.Errorf("expected nameserver 127.0.0.1, got %+v", options[3].DNS)
-	}
-	if len(options[3].DNSSearch) != 1 || options[3].DNSSearch[0] != "." {
-		t.Errorf("expected search \".\", got %+v", options[3].DNSSearch)
-	}
-
-	kubelet.resolverConfig = "/etc/resolv.conf"
-	for i, pod := range pods {
-		var err error
-		options[i], _, err = kubelet.GenerateRunContainerOptions(pod, &v1.Container{}, "")
-		if err != nil {
-			t.Fatalf("failed to generate container options: %v", err)
-		}
-	}
-	t.Logf("nameservers %+v", options[1].DNS)
-	if len(options[0].DNS) != 1 {
-		t.Errorf("expected cluster nameserver only, got %+v", options[0].DNS)
-	} else if options[0].DNS[0] != clusterNS {
-		t.Errorf("expected nameserver %s, got %v", clusterNS, options[0].DNS[0])
-	}
-	expLength := len(options[1].DNSSearch) + 3
-	if expLength > 6 {
-		expLength = 6
-	}
-	if len(options[0].DNSSearch) != expLength {
-		t.Errorf("expected prepend of cluster domain, got %+v", options[0].DNSSearch)
-	} else if options[0].DNSSearch[0] != ".svc."+kubelet.clusterDomain {
-		t.Errorf("expected domain %s, got %s", ".svc."+kubelet.clusterDomain, options[0].DNSSearch)
-	}
-	if len(options[2].DNS) != 1 {
-		t.Errorf("expected cluster nameserver only, got %+v", options[2].DNS)
-	} else if options[2].DNS[0] != clusterNS {
-		t.Errorf("expected nameserver %s, got %v", clusterNS, options[2].DNS[0])
-	}
-	if len(options[2].DNSSearch) != expLength {
-		t.Errorf("expected prepend of cluster domain, got %+v", options[2].DNSSearch)
-	} else if options[2].DNSSearch[0] != ".svc."+kubelet.clusterDomain {
-		t.Errorf("expected domain %s, got %s", ".svc."+kubelet.clusterDomain, options[0].DNSSearch)
-	}
-}
-
 type testServiceLister struct {
 	services []*v1.Service
 }
@@ -388,21 +429,25 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 		buildService("not-special", "kubernetes", "", "TCP", 8088),
 	}
 
+	trueValue := true
+	falseValue := false
 	testCases := []struct {
-		name            string                 // the name of the test case
-		ns              string                 // the namespace to generate environment for
-		container       *v1.Container          // the container to use
-		masterServiceNs string                 // the namespace to read master service info from
-		nilLister       bool                   // whether the lister should be nil
-		configMap       *v1.ConfigMap          // an optional ConfigMap to pull from
-		secret          *v1.Secret             // an optional Secret to pull from
-		expectedEnvs    []kubecontainer.EnvVar // a set of expected environment vars
-		expectedError   bool                   // does the test fail
-		expectedEvent   string                 // does the test emit an event
+		name               string                 // the name of the test case
+		ns                 string                 // the namespace to generate environment for
+		enableServiceLinks *bool                  // enabling service links
+		container          *v1.Container          // the container to use
+		masterServiceNs    string                 // the namespace to read master service info from
+		nilLister          bool                   // whether the lister should be nil
+		configMap          *v1.ConfigMap          // an optional ConfigMap to pull from
+		secret             *v1.Secret             // an optional Secret to pull from
+		expectedEnvs       []kubecontainer.EnvVar // a set of expected environment vars
+		expectedError      bool                   // does the test fail
+		expectedEvent      string                 // does the test emit an event
 	}{
 		{
-			name: "api server = Y, kubelet = Y",
-			ns:   "test1",
+			name:               "api server = Y, kubelet = Y",
+			ns:                 "test1",
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				Env: []v1.EnvVar{
 					{Name: "FOO", Value: "BAR"},
@@ -436,8 +481,9 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 			},
 		},
 		{
-			name: "api server = Y, kubelet = N",
-			ns:   "test1",
+			name:               "api server = Y, kubelet = N",
+			ns:                 "test1",
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				Env: []v1.EnvVar{
 					{Name: "FOO", Value: "BAR"},
@@ -464,8 +510,31 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 			},
 		},
 		{
-			name: "api server = N; kubelet = Y",
-			ns:   "test1",
+			name:               "api server = N; kubelet = Y",
+			ns:                 "test1",
+			enableServiceLinks: &falseValue,
+			container: &v1.Container{
+				Env: []v1.EnvVar{
+					{Name: "FOO", Value: "BAZ"},
+				},
+			},
+			masterServiceNs: metav1.NamespaceDefault,
+			nilLister:       false,
+			expectedEnvs: []kubecontainer.EnvVar{
+				{Name: "FOO", Value: "BAZ"},
+				{Name: "KUBERNETES_SERVICE_HOST", Value: "1.2.3.1"},
+				{Name: "KUBERNETES_SERVICE_PORT", Value: "8081"},
+				{Name: "KUBERNETES_PORT", Value: "tcp://1.2.3.1:8081"},
+				{Name: "KUBERNETES_PORT_8081_TCP", Value: "tcp://1.2.3.1:8081"},
+				{Name: "KUBERNETES_PORT_8081_TCP_PROTO", Value: "tcp"},
+				{Name: "KUBERNETES_PORT_8081_TCP_PORT", Value: "8081"},
+				{Name: "KUBERNETES_PORT_8081_TCP_ADDR", Value: "1.2.3.1"},
+			},
+		},
+		{
+			name:               "api server = N; kubelet = Y; service env vars",
+			ns:                 "test1",
+			enableServiceLinks: &trueValue,
 			container: &v1.Container{
 				Env: []v1.EnvVar{
 					{Name: "FOO", Value: "BAZ"},
@@ -492,8 +561,31 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 			},
 		},
 		{
-			name: "master service in pod ns",
-			ns:   "test2",
+			name:               "master service in pod ns",
+			ns:                 "test2",
+			enableServiceLinks: &falseValue,
+			container: &v1.Container{
+				Env: []v1.EnvVar{
+					{Name: "FOO", Value: "ZAP"},
+				},
+			},
+			masterServiceNs: "kubernetes",
+			nilLister:       false,
+			expectedEnvs: []kubecontainer.EnvVar{
+				{Name: "FOO", Value: "ZAP"},
+				{Name: "KUBERNETES_SERVICE_HOST", Value: "1.2.3.6"},
+				{Name: "KUBERNETES_SERVICE_PORT", Value: "8086"},
+				{Name: "KUBERNETES_PORT", Value: "tcp://1.2.3.6:8086"},
+				{Name: "KUBERNETES_PORT_8086_TCP", Value: "tcp://1.2.3.6:8086"},
+				{Name: "KUBERNETES_PORT_8086_TCP_PROTO", Value: "tcp"},
+				{Name: "KUBERNETES_PORT_8086_TCP_PORT", Value: "8086"},
+				{Name: "KUBERNETES_PORT_8086_TCP_ADDR", Value: "1.2.3.6"},
+			},
+		},
+		{
+			name:               "master service in pod ns, service env vars",
+			ns:                 "test2",
+			enableServiceLinks: &trueValue,
 			container: &v1.Container{
 				Env: []v1.EnvVar{
 					{Name: "FOO", Value: "ZAP"},
@@ -520,11 +612,29 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 			},
 		},
 		{
-			name:            "pod in master service ns",
-			ns:              "kubernetes",
-			container:       &v1.Container{},
-			masterServiceNs: "kubernetes",
-			nilLister:       false,
+			name:               "pod in master service ns",
+			ns:                 "kubernetes",
+			enableServiceLinks: &falseValue,
+			container:          &v1.Container{},
+			masterServiceNs:    "kubernetes",
+			nilLister:          false,
+			expectedEnvs: []kubecontainer.EnvVar{
+				{Name: "KUBERNETES_SERVICE_HOST", Value: "1.2.3.6"},
+				{Name: "KUBERNETES_SERVICE_PORT", Value: "8086"},
+				{Name: "KUBERNETES_PORT", Value: "tcp://1.2.3.6:8086"},
+				{Name: "KUBERNETES_PORT_8086_TCP", Value: "tcp://1.2.3.6:8086"},
+				{Name: "KUBERNETES_PORT_8086_TCP_PROTO", Value: "tcp"},
+				{Name: "KUBERNETES_PORT_8086_TCP_PORT", Value: "8086"},
+				{Name: "KUBERNETES_PORT_8086_TCP_ADDR", Value: "1.2.3.6"},
+			},
+		},
+		{
+			name:               "pod in master service ns, service env vars",
+			ns:                 "kubernetes",
+			enableServiceLinks: &trueValue,
+			container:          &v1.Container{},
+			masterServiceNs:    "kubernetes",
+			nilLister:          false,
 			expectedEnvs: []kubecontainer.EnvVar{
 				{Name: "NOT_SPECIAL_SERVICE_HOST", Value: "1.2.3.8"},
 				{Name: "NOT_SPECIAL_SERVICE_PORT", Value: "8088"},
@@ -543,15 +653,16 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 			},
 		},
 		{
-			name: "downward api pod",
-			ns:   "downward-api",
+			name:               "downward api pod",
+			ns:                 "downward-api",
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				Env: []v1.EnvVar{
 					{
 						Name: "POD_NAME",
 						ValueFrom: &v1.EnvVarSource{
 							FieldRef: &v1.ObjectFieldSelector{
-								APIVersion: api.Registry.GroupOrDie(v1.GroupName).GroupVersion.String(),
+								APIVersion: "v1",
 								FieldPath:  "metadata.name",
 							},
 						},
@@ -560,7 +671,7 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 						Name: "POD_NAMESPACE",
 						ValueFrom: &v1.EnvVarSource{
 							FieldRef: &v1.ObjectFieldSelector{
-								APIVersion: api.Registry.GroupOrDie(v1.GroupName).GroupVersion.String(),
+								APIVersion: "v1",
 								FieldPath:  "metadata.namespace",
 							},
 						},
@@ -569,7 +680,7 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 						Name: "POD_NODE_NAME",
 						ValueFrom: &v1.EnvVarSource{
 							FieldRef: &v1.ObjectFieldSelector{
-								APIVersion: api.Registry.GroupOrDie(v1.GroupName).GroupVersion.String(),
+								APIVersion: "v1",
 								FieldPath:  "spec.nodeName",
 							},
 						},
@@ -578,7 +689,7 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 						Name: "POD_SERVICE_ACCOUNT_NAME",
 						ValueFrom: &v1.EnvVarSource{
 							FieldRef: &v1.ObjectFieldSelector{
-								APIVersion: api.Registry.GroupOrDie(v1.GroupName).GroupVersion.String(),
+								APIVersion: "v1",
 								FieldPath:  "spec.serviceAccountName",
 							},
 						},
@@ -587,7 +698,7 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 						Name: "POD_IP",
 						ValueFrom: &v1.EnvVarSource{
 							FieldRef: &v1.ObjectFieldSelector{
-								APIVersion: api.Registry.GroupOrDie(v1.GroupName).GroupVersion.String(),
+								APIVersion: "v1",
 								FieldPath:  "status.podIP",
 							},
 						},
@@ -596,7 +707,7 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 						Name: "HOST_IP",
 						ValueFrom: &v1.EnvVarSource{
 							FieldRef: &v1.ObjectFieldSelector{
-								APIVersion: api.Registry.GroupOrDie(v1.GroupName).GroupVersion.String(),
+								APIVersion: "v1",
 								FieldPath:  "status.hostIP",
 							},
 						},
@@ -615,8 +726,9 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 			},
 		},
 		{
-			name: "env expansion",
-			ns:   "test1",
+			name:               "env expansion",
+			ns:                 "test1",
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				Env: []v1.EnvVar{
 					{
@@ -627,7 +739,103 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 						Name: "POD_NAME",
 						ValueFrom: &v1.EnvVarSource{
 							FieldRef: &v1.ObjectFieldSelector{
-								APIVersion: api.Registry.GroupOrDie(v1.GroupName).GroupVersion.String(),
+								APIVersion: "v1", //legacyscheme.Registry.GroupOrDie(v1.GroupName).GroupVersion.String(),
+								FieldPath:  "metadata.name",
+							},
+						},
+					},
+					{
+						Name:  "OUT_OF_ORDER_TEST",
+						Value: "$(OUT_OF_ORDER_TARGET)",
+					},
+					{
+						Name:  "OUT_OF_ORDER_TARGET",
+						Value: "FOO",
+					},
+					{
+						Name: "EMPTY_VAR",
+					},
+					{
+						Name:  "EMPTY_TEST",
+						Value: "foo-$(EMPTY_VAR)",
+					},
+					{
+						Name:  "POD_NAME_TEST2",
+						Value: "test2-$(POD_NAME)",
+					},
+					{
+						Name:  "POD_NAME_TEST3",
+						Value: "$(POD_NAME_TEST2)-3",
+					},
+					{
+						Name:  "LITERAL_TEST",
+						Value: "literal-$(TEST_LITERAL)",
+					},
+					{
+						Name:  "TEST_UNDEFINED",
+						Value: "$(UNDEFINED_VAR)",
+					},
+				},
+			},
+			masterServiceNs: "nothing",
+			nilLister:       false,
+			expectedEnvs: []kubecontainer.EnvVar{
+				{
+					Name:  "TEST_LITERAL",
+					Value: "test-test-test",
+				},
+				{
+					Name:  "POD_NAME",
+					Value: "dapi-test-pod-name",
+				},
+				{
+					Name:  "POD_NAME_TEST2",
+					Value: "test2-dapi-test-pod-name",
+				},
+				{
+					Name:  "POD_NAME_TEST3",
+					Value: "test2-dapi-test-pod-name-3",
+				},
+				{
+					Name:  "LITERAL_TEST",
+					Value: "literal-test-test-test",
+				},
+				{
+					Name:  "OUT_OF_ORDER_TEST",
+					Value: "$(OUT_OF_ORDER_TARGET)",
+				},
+				{
+					Name:  "OUT_OF_ORDER_TARGET",
+					Value: "FOO",
+				},
+				{
+					Name:  "TEST_UNDEFINED",
+					Value: "$(UNDEFINED_VAR)",
+				},
+				{
+					Name: "EMPTY_VAR",
+				},
+				{
+					Name:  "EMPTY_TEST",
+					Value: "foo-",
+				},
+			},
+		},
+		{
+			name:               "env expansion, service env vars",
+			ns:                 "test1",
+			enableServiceLinks: &trueValue,
+			container: &v1.Container{
+				Env: []v1.EnvVar{
+					{
+						Name:  "TEST_LITERAL",
+						Value: "test-test-test",
+					},
+					{
+						Name: "POD_NAME",
+						ValueFrom: &v1.EnvVarSource{
+							FieldRef: &v1.ObjectFieldSelector{
+								APIVersion: "v1",
 								FieldPath:  "metadata.name",
 							},
 						},
@@ -746,8 +954,9 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 			},
 		},
 		{
-			name: "configmapkeyref_missing_optional",
-			ns:   "test",
+			name:               "configmapkeyref_missing_optional",
+			ns:                 "test",
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				Env: []v1.EnvVar{
 					{
@@ -766,8 +975,9 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 			expectedEnvs:    nil,
 		},
 		{
-			name: "configmapkeyref_missing_key_optional",
-			ns:   "test",
+			name:               "configmapkeyref_missing_key_optional",
+			ns:                 "test",
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				Env: []v1.EnvVar{
 					{
@@ -796,8 +1006,9 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 			expectedEnvs: nil,
 		},
 		{
-			name: "secretkeyref_missing_optional",
-			ns:   "test",
+			name:               "secretkeyref_missing_optional",
+			ns:                 "test",
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				Env: []v1.EnvVar{
 					{
@@ -816,8 +1027,9 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 			expectedEnvs:    nil,
 		},
 		{
-			name: "secretkeyref_missing_key_optional",
-			ns:   "test",
+			name:               "secretkeyref_missing_key_optional",
+			ns:                 "test",
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				Env: []v1.EnvVar{
 					{
@@ -846,8 +1058,77 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 			expectedEnvs: nil,
 		},
 		{
-			name: "configmap",
-			ns:   "test1",
+			name:               "configmap",
+			ns:                 "test1",
+			enableServiceLinks: &falseValue,
+			container: &v1.Container{
+				EnvFrom: []v1.EnvFromSource{
+					{
+						ConfigMapRef: &v1.ConfigMapEnvSource{LocalObjectReference: v1.LocalObjectReference{Name: "test-config-map"}},
+					},
+					{
+						Prefix:       "p_",
+						ConfigMapRef: &v1.ConfigMapEnvSource{LocalObjectReference: v1.LocalObjectReference{Name: "test-config-map"}},
+					},
+				},
+				Env: []v1.EnvVar{
+					{
+						Name:  "TEST_LITERAL",
+						Value: "test-test-test",
+					},
+					{
+						Name:  "EXPANSION_TEST",
+						Value: "$(REPLACE_ME)",
+					},
+					{
+						Name:  "DUPE_TEST",
+						Value: "ENV_VAR",
+					},
+				},
+			},
+			masterServiceNs: "nothing",
+			nilLister:       false,
+			configMap: &v1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "test1",
+					Name:      "test-configmap",
+				},
+				Data: map[string]string{
+					"REPLACE_ME": "FROM_CONFIG_MAP",
+					"DUPE_TEST":  "CONFIG_MAP",
+				},
+			},
+			expectedEnvs: []kubecontainer.EnvVar{
+				{
+					Name:  "TEST_LITERAL",
+					Value: "test-test-test",
+				},
+				{
+					Name:  "REPLACE_ME",
+					Value: "FROM_CONFIG_MAP",
+				},
+				{
+					Name:  "EXPANSION_TEST",
+					Value: "FROM_CONFIG_MAP",
+				},
+				{
+					Name:  "DUPE_TEST",
+					Value: "ENV_VAR",
+				},
+				{
+					Name:  "p_REPLACE_ME",
+					Value: "FROM_CONFIG_MAP",
+				},
+				{
+					Name:  "p_DUPE_TEST",
+					Value: "CONFIG_MAP",
+				},
+			},
+		},
+		{
+			name:               "configmap, service env vars",
+			ns:                 "test1",
+			enableServiceLinks: &trueValue,
 			container: &v1.Container{
 				EnvFrom: []v1.EnvFromSource{
 					{
@@ -941,8 +1222,9 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 			},
 		},
 		{
-			name: "configmap_missing",
-			ns:   "test1",
+			name:               "configmap_missing",
+			ns:                 "test1",
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				EnvFrom: []v1.EnvFromSource{
 					{ConfigMapRef: &v1.ConfigMapEnvSource{LocalObjectReference: v1.LocalObjectReference{Name: "test-config-map"}}},
@@ -952,8 +1234,9 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 			expectedError:   true,
 		},
 		{
-			name: "configmap_missing_optional",
-			ns:   "test",
+			name:               "configmap_missing_optional",
+			ns:                 "test",
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				EnvFrom: []v1.EnvFromSource{
 					{ConfigMapRef: &v1.ConfigMapEnvSource{
@@ -965,8 +1248,9 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 			expectedEnvs:    nil,
 		},
 		{
-			name: "configmap_invalid_keys",
-			ns:   "test",
+			name:               "configmap_invalid_keys",
+			ns:                 "test",
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				EnvFrom: []v1.EnvFromSource{
 					{ConfigMapRef: &v1.ConfigMapEnvSource{LocalObjectReference: v1.LocalObjectReference{Name: "test-config-map"}}},
@@ -993,8 +1277,9 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 			expectedEvent: "Warning InvalidEnvironmentVariableNames Keys [1234, 1z] from the EnvFrom configMap test/test-config-map were skipped since they are considered invalid environment variable names.",
 		},
 		{
-			name: "configmap_invalid_keys_valid",
-			ns:   "test",
+			name:               "configmap_invalid_keys_valid",
+			ns:                 "test",
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				EnvFrom: []v1.EnvFromSource{
 					{
@@ -1021,8 +1306,77 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 			},
 		},
 		{
-			name: "secret",
-			ns:   "test1",
+			name:               "secret",
+			ns:                 "test1",
+			enableServiceLinks: &falseValue,
+			container: &v1.Container{
+				EnvFrom: []v1.EnvFromSource{
+					{
+						SecretRef: &v1.SecretEnvSource{LocalObjectReference: v1.LocalObjectReference{Name: "test-secret"}},
+					},
+					{
+						Prefix:    "p_",
+						SecretRef: &v1.SecretEnvSource{LocalObjectReference: v1.LocalObjectReference{Name: "test-secret"}},
+					},
+				},
+				Env: []v1.EnvVar{
+					{
+						Name:  "TEST_LITERAL",
+						Value: "test-test-test",
+					},
+					{
+						Name:  "EXPANSION_TEST",
+						Value: "$(REPLACE_ME)",
+					},
+					{
+						Name:  "DUPE_TEST",
+						Value: "ENV_VAR",
+					},
+				},
+			},
+			masterServiceNs: "nothing",
+			nilLister:       false,
+			secret: &v1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "test1",
+					Name:      "test-secret",
+				},
+				Data: map[string][]byte{
+					"REPLACE_ME": []byte("FROM_SECRET"),
+					"DUPE_TEST":  []byte("SECRET"),
+				},
+			},
+			expectedEnvs: []kubecontainer.EnvVar{
+				{
+					Name:  "TEST_LITERAL",
+					Value: "test-test-test",
+				},
+				{
+					Name:  "REPLACE_ME",
+					Value: "FROM_SECRET",
+				},
+				{
+					Name:  "EXPANSION_TEST",
+					Value: "FROM_SECRET",
+				},
+				{
+					Name:  "DUPE_TEST",
+					Value: "ENV_VAR",
+				},
+				{
+					Name:  "p_REPLACE_ME",
+					Value: "FROM_SECRET",
+				},
+				{
+					Name:  "p_DUPE_TEST",
+					Value: "SECRET",
+				},
+			},
+		},
+		{
+			name:               "secret, service env vars",
+			ns:                 "test1",
+			enableServiceLinks: &trueValue,
 			container: &v1.Container{
 				EnvFrom: []v1.EnvFromSource{
 					{
@@ -1116,8 +1470,9 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 			},
 		},
 		{
-			name: "secret_missing",
-			ns:   "test1",
+			name:               "secret_missing",
+			ns:                 "test1",
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				EnvFrom: []v1.EnvFromSource{
 					{SecretRef: &v1.SecretEnvSource{LocalObjectReference: v1.LocalObjectReference{Name: "test-secret"}}},
@@ -1127,8 +1482,9 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 			expectedError:   true,
 		},
 		{
-			name: "secret_missing_optional",
-			ns:   "test",
+			name:               "secret_missing_optional",
+			ns:                 "test",
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				EnvFrom: []v1.EnvFromSource{
 					{SecretRef: &v1.SecretEnvSource{
@@ -1140,8 +1496,9 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 			expectedEnvs:    nil,
 		},
 		{
-			name: "secret_invalid_keys",
-			ns:   "test",
+			name:               "secret_invalid_keys",
+			ns:                 "test",
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				EnvFrom: []v1.EnvFromSource{
 					{SecretRef: &v1.SecretEnvSource{LocalObjectReference: v1.LocalObjectReference{Name: "test-secret"}}},
@@ -1154,22 +1511,23 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 					Name:      "test-secret",
 				},
 				Data: map[string][]byte{
-					"1234": []byte("abc"),
-					"1z":   []byte("abc"),
-					"key":  []byte("value"),
+					"1234":  []byte("abc"),
+					"1z":    []byte("abc"),
+					"key.1": []byte("value"),
 				},
 			},
 			expectedEnvs: []kubecontainer.EnvVar{
 				{
-					Name:  "key",
+					Name:  "key.1",
 					Value: "value",
 				},
 			},
 			expectedEvent: "Warning InvalidEnvironmentVariableNames Keys [1234, 1z] from the EnvFrom secret test/test-secret were skipped since they are considered invalid environment variable names.",
 		},
 		{
-			name: "secret_invalid_keys_valid",
-			ns:   "test",
+			name:               "secret_invalid_keys_valid",
+			ns:                 "test",
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				EnvFrom: []v1.EnvFromSource{
 					{
@@ -1185,15 +1543,39 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 					Name:      "test-secret",
 				},
 				Data: map[string][]byte{
-					"1234": []byte("abc"),
+					"1234.name": []byte("abc"),
 				},
 			},
 			expectedEnvs: []kubecontainer.EnvVar{
 				{
-					Name:  "p_1234",
+					Name:  "p_1234.name",
 					Value: "abc",
 				},
 			},
+		},
+		{
+			name:               "nil_enableServiceLinks",
+			ns:                 "test",
+			enableServiceLinks: nil,
+			container: &v1.Container{
+				EnvFrom: []v1.EnvFromSource{
+					{
+						Prefix:    "p_",
+						SecretRef: &v1.SecretEnvSource{LocalObjectReference: v1.LocalObjectReference{Name: "test-secret"}},
+					},
+				},
+			},
+			masterServiceNs: "",
+			secret: &v1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "test1",
+					Name:      "test-secret",
+				},
+				Data: map[string][]byte{
+					"1234.name": []byte("abc"),
+				},
+			},
+			expectedError: true,
 		},
 	}
 
@@ -1241,6 +1623,7 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 			Spec: v1.PodSpec{
 				ServiceAccountName: "special",
 				NodeName:           "node-name",
+				EnableServiceLinks: tc.enableServiceLinks,
 			},
 		}
 		podIP := "1.2.3.4"
@@ -1417,7 +1800,7 @@ func TestPodPhaseWithRestartAlways(t *testing.T) {
 		},
 	}
 	for _, test := range tests {
-		status := GetPhase(&test.pod.Spec, test.pod.Status.ContainerStatuses)
+		status := getPhase(&test.pod.Spec, test.pod.Status.ContainerStatuses)
 		assert.Equal(t, test.status, status, "[test %s]", test.test)
 	}
 }
@@ -1517,7 +1900,7 @@ func TestPodPhaseWithRestartNever(t *testing.T) {
 		},
 	}
 	for _, test := range tests {
-		status := GetPhase(&test.pod.Spec, test.pod.Status.ContainerStatuses)
+		status := getPhase(&test.pod.Spec, test.pod.Status.ContainerStatuses)
 		assert.Equal(t, test.status, status, "[test %s]", test.test)
 	}
 }
@@ -1630,26 +2013,12 @@ func TestPodPhaseWithRestartOnFailure(t *testing.T) {
 		},
 	}
 	for _, test := range tests {
-		status := GetPhase(&test.pod.Spec, test.pod.Status.ContainerStatuses)
+		status := getPhase(&test.pod.Spec, test.pod.Status.ContainerStatuses)
 		assert.Equal(t, test.status, status, "[test %s]", test.test)
 	}
 }
 
-type fakeReadWriteCloser struct{}
-
-func (f *fakeReadWriteCloser) Write(data []byte) (int, error) {
-	return 0, nil
-}
-
-func (f *fakeReadWriteCloser) Read(data []byte) (int, error) {
-	return 0, nil
-}
-
-func (f *fakeReadWriteCloser) Close() error {
-	return nil
-}
-
-func TestExec(t *testing.T) {
+func TestGetExec(t *testing.T) {
 	const (
 		podName                = "podFoo"
 		podNamespace           = "nsFoo"
@@ -1658,11 +2027,8 @@ func TestExec(t *testing.T) {
 		tty                    = true
 	)
 	var (
-		podFullName = kubecontainer.GetPodFullName(podWithUidNameNs(podUID, podName, podNamespace))
+		podFullName = kubecontainer.GetPodFullName(podWithUIDNameNs(podUID, podName, podNamespace))
 		command     = []string{"ls"}
-		stdin       = &bytes.Buffer{}
-		stdout      = &fakeReadWriteCloser{}
-		stderr      = &fakeReadWriteCloser{}
 	)
 
 	testcases := []struct {
@@ -1703,65 +2069,27 @@ func TestExec(t *testing.T) {
 			}},
 		}
 
-		{ // No streaming case
-			description := "no streaming - " + tc.description
-			redirect, err := kubelet.GetExec(tc.podFullName, podUID, tc.container, command, remotecommand.Options{})
-			assert.Error(t, err, description)
-			assert.Nil(t, redirect, description)
+		description := "streaming - " + tc.description
+		fakeRuntime := &containertest.FakeStreamingRuntime{FakeRuntime: testKubelet.fakeRuntime}
+		kubelet.containerRuntime = fakeRuntime
+		kubelet.streamingRuntime = fakeRuntime
 
-			err = kubelet.ExecInContainer(tc.podFullName, podUID, tc.container, command, stdin, stdout, stderr, tty, nil, 0)
+		redirect, err := kubelet.GetExec(tc.podFullName, podUID, tc.container, command, remotecommand.Options{})
+		if tc.expectError {
 			assert.Error(t, err, description)
-		}
-		{ // Direct streaming case
-			description := "direct streaming - " + tc.description
-			fakeRuntime := &containertest.FakeDirectStreamingRuntime{FakeRuntime: testKubelet.fakeRuntime}
-			kubelet.containerRuntime = fakeRuntime
-
-			redirect, err := kubelet.GetExec(tc.podFullName, podUID, tc.container, command, remotecommand.Options{})
+		} else {
 			assert.NoError(t, err, description)
-			assert.Nil(t, redirect, description)
-
-			err = kubelet.ExecInContainer(tc.podFullName, podUID, tc.container, command, stdin, stdout, stderr, tty, nil, 0)
-			if tc.expectError {
-				assert.Error(t, err, description)
-			} else {
-				assert.NoError(t, err, description)
-				assert.Equal(t, fakeRuntime.Args.ContainerID.ID, containerID, description+": ID")
-				assert.Equal(t, fakeRuntime.Args.Cmd, command, description+": Command")
-				assert.Equal(t, fakeRuntime.Args.Stdin, stdin, description+": Stdin")
-				assert.Equal(t, fakeRuntime.Args.Stdout, stdout, description+": Stdout")
-				assert.Equal(t, fakeRuntime.Args.Stderr, stderr, description+": Stderr")
-				assert.Equal(t, fakeRuntime.Args.TTY, tty, description+": TTY")
-			}
-		}
-		{ // Indirect streaming case
-			description := "indirect streaming - " + tc.description
-			fakeRuntime := &containertest.FakeIndirectStreamingRuntime{FakeRuntime: testKubelet.fakeRuntime}
-			kubelet.containerRuntime = fakeRuntime
-
-			redirect, err := kubelet.GetExec(tc.podFullName, podUID, tc.container, command, remotecommand.Options{})
-			if tc.expectError {
-				assert.Error(t, err, description)
-			} else {
-				assert.NoError(t, err, description)
-				assert.Equal(t, containertest.FakeHost, redirect.Host, description+": redirect")
-			}
-
-			err = kubelet.ExecInContainer(tc.podFullName, podUID, tc.container, command, stdin, stdout, stderr, tty, nil, 0)
-			assert.Error(t, err, description)
+			assert.Equal(t, containertest.FakeHost, redirect.Host, description+": redirect")
 		}
 	}
 }
 
-func TestPortForward(t *testing.T) {
+func TestGetPortForward(t *testing.T) {
 	const (
 		podName                = "podFoo"
 		podNamespace           = "nsFoo"
 		podUID       types.UID = "12345678"
 		port         int32     = 5000
-	)
-	var (
-		stream = &fakeReadWriteCloser{}
 	)
 
 	testcases := []struct {
@@ -1794,71 +2122,19 @@ func TestPortForward(t *testing.T) {
 			}},
 		}
 
-		podFullName := kubecontainer.GetPodFullName(podWithUidNameNs(podUID, tc.podName, podNamespace))
-		{ // No streaming case
-			description := "no streaming - " + tc.description
-			redirect, err := kubelet.GetPortForward(tc.podName, podNamespace, podUID, portforward.V4Options{})
-			assert.Error(t, err, description)
-			assert.Nil(t, redirect, description)
+		description := "streaming - " + tc.description
+		fakeRuntime := &containertest.FakeStreamingRuntime{FakeRuntime: testKubelet.fakeRuntime}
+		kubelet.containerRuntime = fakeRuntime
+		kubelet.streamingRuntime = fakeRuntime
 
-			err = kubelet.PortForward(podFullName, podUID, port, stream)
+		redirect, err := kubelet.GetPortForward(tc.podName, podNamespace, podUID, portforward.V4Options{})
+		if tc.expectError {
 			assert.Error(t, err, description)
-		}
-		{ // Direct streaming case
-			description := "direct streaming - " + tc.description
-			fakeRuntime := &containertest.FakeDirectStreamingRuntime{FakeRuntime: testKubelet.fakeRuntime}
-			kubelet.containerRuntime = fakeRuntime
-
-			redirect, err := kubelet.GetPortForward(tc.podName, podNamespace, podUID, portforward.V4Options{})
+		} else {
 			assert.NoError(t, err, description)
-			assert.Nil(t, redirect, description)
-
-			err = kubelet.PortForward(podFullName, podUID, port, stream)
-			if tc.expectError {
-				assert.Error(t, err, description)
-			} else {
-				assert.NoError(t, err, description)
-				require.Equal(t, fakeRuntime.Args.Pod.ID, podUID, description+": Pod UID")
-				require.Equal(t, fakeRuntime.Args.Port, port, description+": Port")
-				require.Equal(t, fakeRuntime.Args.Stream, stream, description+": stream")
-			}
-		}
-		{ // Indirect streaming case
-			description := "indirect streaming - " + tc.description
-			fakeRuntime := &containertest.FakeIndirectStreamingRuntime{FakeRuntime: testKubelet.fakeRuntime}
-			kubelet.containerRuntime = fakeRuntime
-
-			redirect, err := kubelet.GetPortForward(tc.podName, podNamespace, podUID, portforward.V4Options{})
-			if tc.expectError {
-				assert.Error(t, err, description)
-			} else {
-				assert.NoError(t, err, description)
-				assert.Equal(t, containertest.FakeHost, redirect.Host, description+": redirect")
-			}
-
-			err = kubelet.PortForward(podFullName, podUID, port, stream)
-			assert.Error(t, err, description)
+			assert.Equal(t, containertest.FakeHost, redirect.Host, description+": redirect")
 		}
 	}
-}
-
-// Tests that identify the host port conflicts are detected correctly.
-func TestGetHostPortConflicts(t *testing.T) {
-	pods := []*v1.Pod{
-		{Spec: v1.PodSpec{Containers: []v1.Container{{Ports: []v1.ContainerPort{{HostPort: 80}}}}}},
-		{Spec: v1.PodSpec{Containers: []v1.Container{{Ports: []v1.ContainerPort{{HostPort: 81}}}}}},
-		{Spec: v1.PodSpec{Containers: []v1.Container{{Ports: []v1.ContainerPort{{HostPort: 82}}}}}},
-		{Spec: v1.PodSpec{Containers: []v1.Container{{Ports: []v1.ContainerPort{{HostPort: 83}}}}}},
-	}
-	// Pods should not cause any conflict.
-	assert.False(t, hasHostPortConflicts(pods), "Should not have port conflicts")
-
-	expected := &v1.Pod{
-		Spec: v1.PodSpec{Containers: []v1.Container{{Ports: []v1.ContainerPort{{HostPort: 81}}}}},
-	}
-	// The new pod should cause conflict and be reported.
-	pods = append(pods, expected)
-	assert.True(t, hasHostPortConflicts(pods), "Should have port conflicts")
 }
 
 func TestHasHostMountPVC(t *testing.T) {

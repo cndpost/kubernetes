@@ -1,3 +1,5 @@
+# See the OWNERS docs at https://go.k8s.io/owners
+
 approvers:
 - lavalamp
 - liggitt
@@ -5,27 +7,16 @@ approvers:
 - wojtek-t
 - xiang90
 reviewers:
-- thockin
 - lavalamp
 - smarterclayton
 - wojtek-t
 - deads2k
-- derekwaynecarr
 - caesarxuchao
 - mikedanese
 - liggitt
-- erictune
-- davidopp
-- pmorie
-- luxas
-- janetkuo
-- roberthbailey
 - ncdc
-- timstclair
+- tallclair
 - timothysc
-- soltysh
-- dims
-- madhusudancs
 - hongchaodeng
 - krousey
 - fgrzadkowski
@@ -34,8 +25,8 @@ reviewers:
 - ingvagabund
 - resouer
 - mbohlool
-- pweil-
 - lixiaobing10051267
 - mqliang
 - feihujiang
 - rrati
+- enj

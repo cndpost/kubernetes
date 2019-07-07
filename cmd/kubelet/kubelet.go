@@ -21,39 +21,24 @@ limitations under the License.
 package main
 
 import (
-	"fmt"
+	"math/rand"
 	"os"
+	"time"
 
-	"k8s.io/apiserver/pkg/util/flag"
-	"k8s.io/apiserver/pkg/util/logs"
+	"k8s.io/component-base/logs"
 	"k8s.io/kubernetes/cmd/kubelet/app"
-	"k8s.io/kubernetes/cmd/kubelet/app/options"
 	_ "k8s.io/kubernetes/pkg/client/metrics/prometheus" // for client metric registration
 	_ "k8s.io/kubernetes/pkg/version/prometheus"        // for version metric registration
-	"k8s.io/kubernetes/pkg/version/verflag"
-
-	"github.com/spf13/pflag"
 )
 
 func main() {
-	s := options.NewKubeletServer()
-	s.AddFlags(pflag.CommandLine)
+	rand.Seed(time.Now().UnixNano())
 
-	flag.InitFlags()
+	command := app.NewKubeletCommand()
 	logs.InitLogs()
 	defer logs.FlushLogs()
 
-	verflag.PrintAndExitIfRequested()
-
-	if s.ExperimentalDockershim {
-		if err := app.RunDockershim(&s.KubeletConfiguration, s.DockershimRootDirectory); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			os.Exit(1)
-		}
-	}
-
-	if err := app.Run(s, nil); err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+	if err := command.Execute(); err != nil {
 		os.Exit(1)
 	}
 }

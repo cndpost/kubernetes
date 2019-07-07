@@ -1,11 +1,4 @@
-package(default_visibility = ["//visibility:public"])
-
-licenses(["notice"])
-
-load(
-    "@io_bazel_rules_go//go:def.bzl",
-    "go_library",
-)
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "go_default_library",
@@ -14,10 +7,13 @@ go_library(
         "util.go",
         "viper.go",
     ],
-    tags = ["automanaged"],
+    importmap = "k8s.io/kubernetes/vendor/github.com/spf13/viper",
+    importpath = "github.com/spf13/viper",
+    visibility = ["//visibility:public"],
     deps = [
         "//vendor/github.com/fsnotify/fsnotify:go_default_library",
         "//vendor/github.com/hashicorp/hcl:go_default_library",
+        "//vendor/github.com/hashicorp/hcl/hcl/printer:go_default_library",
         "//vendor/github.com/magiconair/properties:go_default_library",
         "//vendor/github.com/mitchellh/mapstructure:go_default_library",
         "//vendor/github.com/pelletier/go-toml:go_default_library",
@@ -40,4 +36,5 @@ filegroup(
     name = "all-srcs",
     srcs = [":package-srcs"],
     tags = ["automanaged"],
+    visibility = ["//visibility:public"],
 )

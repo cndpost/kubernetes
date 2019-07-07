@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Copyright 2015 The Kubernetes Authors.
 #
@@ -19,13 +19,13 @@
 # they are written using the latest API version.
 #
 # Steps to use this script to upgrade the cluster to a new version:
-# https://github.com/kubernetes/kubernetes/blob/master/docs/cluster_management.md#updgrading-to-a-different-api-version
+# https://kubernetes.io/docs/tasks/administer-cluster/cluster-management/#upgrading-to-a-different-api-version
 
 set -o errexit
 set -o nounset
 set -o pipefail
 
-KUBE_ROOT=$(dirname "${BASH_SOURCE}")/..
+KUBE_ROOT=$(dirname "${BASH_SOURCE[0]}")/..
 source "${KUBE_ROOT}/hack/lib/init.sh"
 
 KUBECTL="${KUBE_OUTPUT_HOSTBIN}/kubectl"
@@ -48,10 +48,17 @@ declare -a resources=(
     "services"
     "jobs"
     "horizontalpodautoscalers"
+    "storageclasses"
+    "roles.rbac.authorization.k8s.io"
+    "rolebindings.rbac.authorization.k8s.io"
+    "clusterroles.rbac.authorization.k8s.io"
+    "clusterrolebindings.rbac.authorization.k8s.io"
+    "networkpolicies.networking.k8s.io"
+    "ingresses.networking.k8s.io"
 )
 
 # Find all the namespaces.
-namespaces=( $("${KUBECTL}" get namespaces -o go-template="{{range.items}}{{.metadata.name}} {{end}}"))
+IFS=" " read -r -a namespaces <<< "$("${KUBECTL}" get namespaces -o go-template="{{range.items}}{{.metadata.name}} {{end}}")"
 if [ -z "${namespaces:-}" ]
 then
   echo "Unexpected: No namespace found. Nothing to do."
@@ -68,7 +75,7 @@ do
     # TODO hopefully we can remove this once we use dynamic discovery of gettable/updateable
     # resources.
     set +e
-    instances=( $("${KUBECTL}" get "${resource}" --namespace="${namespace}" -o go-template="{{range.items}}{{.metadata.name}} {{end}}"))
+    IFS=" " read -r -a instances <<< "$("${KUBECTL}" get "${resource}" --namespace="${namespace}" -o go-template="{{range.items}}{{.metadata.name}} {{end}}")"
     result=$?
     set -e
 
@@ -98,7 +105,8 @@ do
           # This happens when the instance has been deleted. We can hence ignore
           # this instance.
           echo "Looks like ${instance} got deleted. Ignoring it"
-          continue
+          success=1
+          break
         fi
         output=$("${KUBECTL}" replace -f "${filename}" --namespace="${namespace}") || true
         rm "${filename}"

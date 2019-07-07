@@ -1,17 +1,11 @@
-package(default_visibility = ["//visibility:public"])
-
-licenses(["notice"])
-
-load(
-    "@io_bazel_rules_go//go:def.bzl",
-    "go_library",
-)
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "go_default_library",
     srcs = [
         "and.go",
         "assignable_to_type_of_matcher.go",
+        "attributes_slice.go",
         "be_a_directory.go",
         "be_a_regular_file.go",
         "be_an_existing_file.go",
@@ -40,21 +34,26 @@ go_library(
         "match_error_matcher.go",
         "match_json_matcher.go",
         "match_regexp_matcher.go",
+        "match_xml_matcher.go",
         "match_yaml_matcher.go",
         "not.go",
         "or.go",
         "panic_matcher.go",
         "receive_matcher.go",
+        "semi_structured_data_support.go",
         "succeed_matcher.go",
         "type_support.go",
         "with_transform.go",
     ],
-    tags = ["automanaged"],
+    importmap = "k8s.io/kubernetes/vendor/github.com/onsi/gomega/matchers",
+    importpath = "github.com/onsi/gomega/matchers",
+    visibility = ["//visibility:public"],
     deps = [
         "//vendor/github.com/onsi/gomega/format:go_default_library",
         "//vendor/github.com/onsi/gomega/internal/oraclematcher:go_default_library",
         "//vendor/github.com/onsi/gomega/matchers/support/goraph/bipartitegraph:go_default_library",
         "//vendor/github.com/onsi/gomega/types:go_default_library",
+        "//vendor/golang.org/x/net/html/charset:go_default_library",
         "//vendor/gopkg.in/yaml.v2:go_default_library",
     ],
 )
@@ -76,4 +75,5 @@ filegroup(
         "//vendor/github.com/onsi/gomega/matchers/support/goraph/util:all-srcs",
     ],
     tags = ["automanaged"],
+    visibility = ["//visibility:public"],
 )

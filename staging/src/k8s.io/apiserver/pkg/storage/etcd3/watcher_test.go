@@ -17,19 +17,17 @@ limitations under the License.
 package etcd3
 
 import (
-	"errors"
+	"context"
 	"fmt"
 	"reflect"
-	"strconv"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/coreos/etcd/clientv3"
 	"github.com/coreos/etcd/integration"
-	"golang.org/x/net/context"
 
-	apitesting "k8s.io/apimachinery/pkg/api/testing"
+	apitesting "k8s.io/apimachinery/pkg/api/apitesting"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
@@ -137,7 +135,7 @@ func TestDeleteTriggerWatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Watch failed: %v", err)
 	}
-	if err := store.Delete(ctx, key, &example.Pod{}, nil); err != nil {
+	if err := store.Delete(ctx, key, &example.Pod{}, nil, storage.ValidateAllObjectFunc); err != nil {
 		t.Fatalf("Delete failed: %v", err)
 	}
 	testCheckEventType(t, watch.Deleted, w)
@@ -187,7 +185,7 @@ func TestWatchFromZero(t *testing.T) {
 	}
 
 	// Compact previous versions
-	revToCompact, err := strconv.Atoi(out.ResourceVersion)
+	revToCompact, err := store.versioner.ParseResourceVersion(out.ResourceVersion)
 	if err != nil {
 		t.Fatalf("Error converting %q to an int: %v", storedObj.ResourceVersion, err)
 	}
@@ -227,13 +225,13 @@ func TestWatchError(t *testing.T) {
 	codec := &testCodec{apitesting.TestCodec(codecs, examplev1.SchemeGroupVersion)}
 	cluster := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
 	defer cluster.Terminate(t)
-	invalidStore := newStore(cluster.RandClient(), false, codec, "", prefixTransformer{prefix: []byte("test!")})
+	invalidStore := newStore(cluster.RandClient(), true, codec, "", prefixTransformer{prefix: []byte("test!")})
 	ctx := context.Background()
 	w, err := invalidStore.Watch(ctx, "/abc", "0", storage.Everything)
 	if err != nil {
 		t.Fatalf("Watch failed: %v", err)
 	}
-	validStore := newStore(cluster.RandClient(), false, codec, "", prefixTransformer{prefix: []byte("test!")})
+	validStore := newStore(cluster.RandClient(), true, codec, "", prefixTransformer{prefix: []byte("test!")})
 	validStore.GuaranteedUpdate(ctx, "/abc", &example.Pod{}, true, nil, storage.SimpleUpdate(
 		func(runtime.Object) (runtime.Object, error) {
 			return &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "foo"}}, nil
@@ -297,7 +295,7 @@ func TestWatchDeleteEventObjectHaveLatestRV(t *testing.T) {
 	}
 	etcdW := cluster.RandClient().Watch(ctx, "/", clientv3.WithPrefix())
 
-	if err := store.Delete(ctx, key, &example.Pod{}, &storage.Preconditions{}); err != nil {
+	if err := store.Delete(ctx, key, &example.Pod{}, &storage.Preconditions{}, storage.ValidateAllObjectFunc); err != nil {
 		t.Fatalf("Delete failed: %v", err)
 	}
 
@@ -306,7 +304,7 @@ func TestWatchDeleteEventObjectHaveLatestRV(t *testing.T) {
 	var wres clientv3.WatchResponse
 	wres = <-etcdW
 
-	watchedDeleteRev, err := storage.ParseWatchResourceVersion(watchedDeleteObj.ResourceVersion)
+	watchedDeleteRev, err := store.versioner.ParseResourceVersion(watchedDeleteObj.ResourceVersion)
 	if err != nil {
 		t.Fatalf("ParseWatchResourceVersion failed: %v", err)
 	}
@@ -327,7 +325,7 @@ type testCodec struct {
 }
 
 func (c *testCodec) Decode(data []byte, defaults *schema.GroupVersionKind, into runtime.Object) (runtime.Object, *schema.GroupVersionKind, error) {
-	return nil, nil, errors.New("Expected decoding failure")
+	return nil, nil, errTestingDecode
 }
 
 func testCheckEventType(t *testing.T, expectEventType watch.EventType, w watch.Interface) {

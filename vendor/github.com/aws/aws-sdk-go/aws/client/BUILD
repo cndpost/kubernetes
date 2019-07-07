@@ -1,23 +1,20 @@
-package(default_visibility = ["//visibility:public"])
-
-licenses(["notice"])
-
-load(
-    "@io_bazel_rules_go//go:def.bzl",
-    "go_library",
-)
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "go_default_library",
     srcs = [
         "client.go",
         "default_retryer.go",
+        "logger.go",
     ],
-    tags = ["automanaged"],
+    importmap = "k8s.io/kubernetes/vendor/github.com/aws/aws-sdk-go/aws/client",
+    importpath = "github.com/aws/aws-sdk-go/aws/client",
+    visibility = ["//visibility:public"],
     deps = [
         "//vendor/github.com/aws/aws-sdk-go/aws:go_default_library",
         "//vendor/github.com/aws/aws-sdk-go/aws/client/metadata:go_default_library",
         "//vendor/github.com/aws/aws-sdk-go/aws/request:go_default_library",
+        "//vendor/github.com/aws/aws-sdk-go/internal/sdkrand:go_default_library",
     ],
 )
 
@@ -35,4 +32,5 @@ filegroup(
         "//vendor/github.com/aws/aws-sdk-go/aws/client/metadata:all-srcs",
     ],
     tags = ["automanaged"],
+    visibility = ["//visibility:public"],
 )

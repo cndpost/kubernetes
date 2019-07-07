@@ -21,8 +21,8 @@ import (
 	"testing"
 	"time"
 
+	"k8s.io/apimachinery/pkg/util/clock"
 	expirationcache "k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/util/clock"
 )
 
 type testObject struct {
@@ -46,7 +46,7 @@ func TestAddAndGet(t *testing.T) {
 		val: "bar",
 	}
 	objectCache := NewFakeObjectCache(func() (interface{}, error) {
-		return nil, fmt.Errorf("Unexpected Error: updater should never be called in this test!")
+		return nil, fmt.Errorf("Unexpected Error: updater should never be called in this test")
 	}, 1*time.Hour, clock.NewFakeClock(time.Now()))
 
 	err := objectCache.Add(testObj.key, testObj.val)

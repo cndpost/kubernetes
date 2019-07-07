@@ -17,14 +17,16 @@ limitations under the License.
 package testing
 
 import (
+	"context"
 	"io"
 	"time"
 
 	"github.com/stretchr/testify/mock"
+	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/remotecommand"
 	"k8s.io/client-go/util/flowcontrol"
-	"k8s.io/kubernetes/pkg/api/v1"
-	"k8s.io/kubernetes/pkg/client/unversioned/remotecommand"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 	. "k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/pkg/volume"
 )
@@ -65,8 +67,8 @@ func (r *Mock) GetPods(all bool) ([]*Pod, error) {
 	return args.Get(0).([]*Pod), args.Error(1)
 }
 
-func (r *Mock) SyncPod(pod *v1.Pod, apiStatus v1.PodStatus, status *PodStatus, secrets []v1.Secret, backOff *flowcontrol.Backoff) PodSyncResult {
-	args := r.Called(pod, apiStatus, status, secrets, backOff)
+func (r *Mock) SyncPod(pod *v1.Pod, status *PodStatus, secrets []v1.Secret, backOff *flowcontrol.Backoff) PodSyncResult {
+	args := r.Called(pod, status, secrets, backOff)
 	return args.Get(0).(PodSyncResult)
 }
 
@@ -100,12 +102,12 @@ func (r *Mock) AttachContainer(containerID ContainerID, stdin io.Reader, stdout,
 	return args.Error(0)
 }
 
-func (r *Mock) GetContainerLogs(pod *v1.Pod, containerID ContainerID, logOptions *v1.PodLogOptions, stdout, stderr io.Writer) (err error) {
+func (r *Mock) GetContainerLogs(_ context.Context, pod *v1.Pod, containerID ContainerID, logOptions *v1.PodLogOptions, stdout, stderr io.Writer) (err error) {
 	args := r.Called(pod, containerID, logOptions, stdout, stderr)
 	return args.Error(0)
 }
 
-func (r *Mock) PullImage(image ImageSpec, pullSecrets []v1.Secret) (string, error) {
+func (r *Mock) PullImage(image ImageSpec, pullSecrets []v1.Secret, podSandboxConfig *runtimeapi.PodSandboxConfig) (string, error) {
 	args := r.Called(image, pullSecrets)
 	return image.Image, args.Error(0)
 }
@@ -130,18 +132,8 @@ func (r *Mock) PortForward(pod *Pod, port uint16, stream io.ReadWriteCloser) err
 	return args.Error(0)
 }
 
-func (r *Mock) GetNetNS(containerID ContainerID) (string, error) {
-	args := r.Called(containerID)
-	return "", args.Error(0)
-}
-
-func (r *Mock) GetPodContainerID(pod *Pod) (ContainerID, error) {
-	args := r.Called(pod)
-	return ContainerID{}, args.Error(0)
-}
-
-func (r *Mock) GarbageCollect(gcPolicy ContainerGCPolicy, ready bool) error {
-	args := r.Called(gcPolicy, ready)
+func (r *Mock) GarbageCollect(gcPolicy ContainerGCPolicy, ready bool, evictNonDeletedPods bool) error {
+	args := r.Called(gcPolicy, ready, evictNonDeletedPods)
 	return args.Error(0)
 }
 

@@ -1,17 +1,13 @@
 //
 // Copyright (c) 2015 The heketi Authors
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// This file is licensed to you under your choice of the GNU Lesser
+// General Public License, version 3 or any later version (LGPLv3 or
+// later), as published by the Free Software Foundation,
+// or under the Apache License, Version 2.0 <LICENSE-APACHE2 or
+// http://www.apache.org/licenses/LICENSE-2.0>.
 //
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// You may not use this file except in compliance with those terms.
 //
 
 package client
@@ -19,10 +15,11 @@ package client
 import (
 	"bytes"
 	"encoding/json"
-	"github.com/heketi/heketi/pkg/glusterfs/api"
-	"github.com/heketi/heketi/pkg/utils"
 	"net/http"
 	"time"
+
+	"github.com/heketi/heketi/pkg/glusterfs/api"
+	"github.com/heketi/heketi/pkg/utils"
 )
 
 func (c *Client) NodeAdd(request *api.NodeAddRequest) (*api.NodeInfoResponse, error) {
@@ -51,6 +48,7 @@ func (c *Client) NodeAdd(request *api.NodeAddRequest) (*api.NodeInfoResponse, er
 	if err != nil {
 		return nil, err
 	}
+	defer r.Body.Close()
 	if r.StatusCode != http.StatusAccepted {
 		return nil, utils.GetErrorFromResponse(r)
 	}
@@ -67,7 +65,6 @@ func (c *Client) NodeAdd(request *api.NodeAddRequest) (*api.NodeInfoResponse, er
 	// Read JSON response
 	var node api.NodeInfoResponse
 	err = utils.GetJsonFromResponse(r, &node)
-	r.Body.Close()
 	if err != nil {
 		return nil, err
 	}
@@ -94,6 +91,7 @@ func (c *Client) NodeInfo(id string) (*api.NodeInfoResponse, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer r.Body.Close()
 	if r.StatusCode != http.StatusOK {
 		return nil, utils.GetErrorFromResponse(r)
 	}
@@ -101,7 +99,6 @@ func (c *Client) NodeInfo(id string) (*api.NodeInfoResponse, error) {
 	// Read JSON response
 	var node api.NodeInfoResponse
 	err = utils.GetJsonFromResponse(r, &node)
-	r.Body.Close()
 	if err != nil {
 		return nil, err
 	}
@@ -128,6 +125,7 @@ func (c *Client) NodeDelete(id string) error {
 	if err != nil {
 		return err
 	}
+	defer r.Body.Close()
 	if r.StatusCode != http.StatusAccepted {
 		return utils.GetErrorFromResponse(r)
 	}
@@ -171,6 +169,49 @@ func (c *Client) NodeState(id string, request *api.StateRequest) error {
 	if err != nil {
 		return err
 	}
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusAccepted {
+		return utils.GetErrorFromResponse(r)
+	}
+
+	// Wait for response
+	r, err = c.waitForResponseWithTimer(r, time.Second)
+	if err != nil {
+		return err
+	}
+	if r.StatusCode != http.StatusNoContent {
+		return utils.GetErrorFromResponse(r)
+	}
+
+	return nil
+}
+
+func (c *Client) NodeSetTags(id string, request *api.TagsChangeRequest) error {
+	buffer, err := json.Marshal(request)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest("POST",
+		c.host+"/nodes/"+id+"/tags",
+		bytes.NewBuffer(buffer))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	// Set token
+	err = c.setToken(req)
+	if err != nil {
+		return err
+	}
+
+	// Get info
+	r, err := c.do(req)
+	if err != nil {
+		return err
+	}
+	defer r.Body.Close()
 	if r.StatusCode != http.StatusOK {
 		return utils.GetErrorFromResponse(r)
 	}

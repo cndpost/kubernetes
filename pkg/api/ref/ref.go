@@ -23,12 +23,13 @@ import (
 	"strings"
 
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/kubernetes/pkg/api"
+	api "k8s.io/kubernetes/pkg/apis/core"
 )
 
+// Errors that could be returned by GetReference.
 var (
-	// Errors that could be returned by GetReference.
 	ErrNilObject  = errors.New("can't reference a nil object")
 	ErrNoSelfLink = errors.New("selfLink was empty, can't make reference")
 )
@@ -61,10 +62,10 @@ func GetReference(scheme *runtime.Scheme, obj runtime.Object) (*api.ObjectRefere
 	}
 
 	// An object that implements only List has enough metadata to build a reference
-	var listMeta meta.List
+	var listMeta metav1.Common
 	objectMeta, err := meta.Accessor(obj)
 	if err != nil {
-		listMeta, err = meta.ListAccessor(obj)
+		listMeta, err = meta.CommonAccessor(obj)
 		if err != nil {
 			return nil, err
 		}
@@ -79,12 +80,12 @@ func GetReference(scheme *runtime.Scheme, obj runtime.Object) (*api.ObjectRefere
 		if len(selfLink) == 0 {
 			return nil, ErrNoSelfLink
 		}
-		selfLinkUrl, err := url.Parse(selfLink)
+		selfLinkURL, err := url.Parse(selfLink)
 		if err != nil {
 			return nil, err
 		}
 		// example paths: /<prefix>/<version>/*
-		parts := strings.Split(selfLinkUrl.Path, "/")
+		parts := strings.Split(selfLinkURL.Path, "/")
 		if len(parts) < 3 {
 			return nil, fmt.Errorf("unexpected self link format: '%v'; got version '%v'", selfLink, version)
 		}

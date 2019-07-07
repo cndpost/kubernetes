@@ -20,19 +20,19 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
-	"path"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
 	"testing"
 
+	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/kubernetes/pkg/api/v1"
-	"k8s.io/kubernetes/pkg/client/clientset_generated/clientset"
-	"k8s.io/kubernetes/pkg/client/clientset_generated/clientset/fake"
+	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/kubernetes/pkg/volume"
-	"k8s.io/kubernetes/pkg/volume/empty_dir"
+	"k8s.io/kubernetes/pkg/volume/emptydir"
 	volumetest "k8s.io/kubernetes/pkg/volume/testing"
 	"k8s.io/kubernetes/pkg/volume/util"
 
@@ -268,14 +268,14 @@ func newTestHost(t *testing.T, clientset clientset.Interface) (string, volume.Vo
 		t.Fatalf("can't make a temp rootdir: %v", err)
 	}
 
-	return tempDir, volumetest.NewFakeVolumeHost(tempDir, clientset, empty_dir.ProbeVolumePlugins())
+	return tempDir, volumetest.NewFakeVolumeHost(tempDir, clientset, emptydir.ProbeVolumePlugins())
 }
 
 func TestCanSupport(t *testing.T) {
 	pluginMgr := volume.VolumePluginMgr{}
 	tempDir, host := newTestHost(t, nil)
 	defer os.RemoveAll(tempDir)
-	pluginMgr.InitPlugins(ProbeVolumePlugins(), host)
+	pluginMgr.InitPlugins(ProbeVolumePlugins(), nil /* prober */, host)
 
 	plugin, err := pluginMgr.FindPluginByName(secretPluginName)
 	if err != nil {
@@ -306,7 +306,7 @@ func TestPlugin(t *testing.T) {
 		rootDir, host = newTestHost(t, client)
 	)
 	defer os.RemoveAll(rootDir)
-	pluginMgr.InitPlugins(ProbeVolumePlugins(), host)
+	pluginMgr.InitPlugins(ProbeVolumePlugins(), nil /* prober */, host)
 
 	plugin, err := pluginMgr.FindPluginByName(secretPluginName)
 	if err != nil {
@@ -319,7 +319,7 @@ func TestPlugin(t *testing.T) {
 		t.Errorf("Failed to make a new Mounter: %v", err)
 	}
 	if mounter == nil {
-		t.Errorf("Got a nil Mounter")
+		t.Fatalf("Got a nil Mounter")
 	}
 
 	volumePath := mounter.GetPath()
@@ -327,7 +327,7 @@ func TestPlugin(t *testing.T) {
 		t.Errorf("Got unexpected path: %s", volumePath)
 	}
 
-	err = mounter.SetUp(nil)
+	err = mounter.SetUp(volume.MounterArgs{})
 	if err != nil {
 		t.Errorf("Failed to setup volume: %v", err)
 	}
@@ -362,6 +362,57 @@ func TestPlugin(t *testing.T) {
 	}
 }
 
+func TestInvalidPathSecret(t *testing.T) {
+	var (
+		testPodUID     = types.UID("test_pod_uid")
+		testVolumeName = "test_volume_name"
+		testNamespace  = "test_secret_namespace"
+		testName       = "test_secret_name"
+
+		volumeSpec    = volumeSpec(testVolumeName, testName, 0644)
+		secret        = secret(testNamespace, testName)
+		client        = fake.NewSimpleClientset(&secret)
+		pluginMgr     = volume.VolumePluginMgr{}
+		rootDir, host = newTestHost(t, client)
+	)
+	volumeSpec.Secret.Items = []v1.KeyToPath{
+		{Key: "missing", Path: "missing"},
+	}
+
+	defer os.RemoveAll(rootDir)
+	pluginMgr.InitPlugins(ProbeVolumePlugins(), nil /* prober */, host)
+
+	plugin, err := pluginMgr.FindPluginByName(secretPluginName)
+	if err != nil {
+		t.Errorf("Can't find the plugin by name")
+	}
+
+	pod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, UID: testPodUID}}
+	mounter, err := plugin.NewMounter(volume.NewSpecFromVolume(volumeSpec), pod, volume.VolumeOptions{})
+	if err != nil {
+		t.Errorf("Failed to make a new Mounter: %v", err)
+	}
+	if mounter == nil {
+		t.Fatalf("Got a nil Mounter")
+	}
+
+	volumePath := mounter.GetPath()
+	if !strings.HasSuffix(volumePath, fmt.Sprintf("pods/test_pod_uid/volumes/kubernetes.io~secret/test_volume_name")) {
+		t.Errorf("Got unexpected path: %s", volumePath)
+	}
+
+	var mounterArgs volume.MounterArgs
+	err = mounter.SetUp(mounterArgs)
+	if err == nil {
+		t.Errorf("Expected error while setting up secret")
+	}
+
+	_, err = os.Stat(volumePath)
+	if err == nil {
+		t.Errorf("Expected path %s to not exist", volumePath)
+	}
+}
+
 // Test the case where the plugin's ready file exists, but the volume dir is not a
 // mountpoint, which is the state the system will be in after reboot.  The dir
 // should be mounter and the secret data written to it.
@@ -379,7 +430,7 @@ func TestPluginReboot(t *testing.T) {
 		rootDir, host = newTestHost(t, client)
 	)
 	defer os.RemoveAll(rootDir)
-	pluginMgr.InitPlugins(ProbeVolumePlugins(), host)
+	pluginMgr.InitPlugins(ProbeVolumePlugins(), nil /* prober */, host)
 
 	plugin, err := pluginMgr.FindPluginByName(secretPluginName)
 	if err != nil {
@@ -392,7 +443,7 @@ func TestPluginReboot(t *testing.T) {
 		t.Errorf("Failed to make a new Mounter: %v", err)
 	}
 	if mounter == nil {
-		t.Errorf("Got a nil Mounter")
+		t.Fatalf("Got a nil Mounter")
 	}
 
 	podMetadataDir := fmt.Sprintf("%v/pods/test_pod_uid3/plugins/kubernetes.io~secret/test_volume_name", rootDir)
@@ -402,7 +453,7 @@ func TestPluginReboot(t *testing.T) {
 		t.Errorf("Got unexpected path: %s", volumePath)
 	}
 
-	err = mounter.SetUp(nil)
+	err = mounter.SetUp(volume.MounterArgs{})
 	if err != nil {
 		t.Errorf("Failed to setup volume: %v", err)
 	}
@@ -433,7 +484,7 @@ func TestPluginOptional(t *testing.T) {
 	)
 	volumeSpec.Secret.Optional = &trueVal
 	defer os.RemoveAll(rootDir)
-	pluginMgr.InitPlugins(ProbeVolumePlugins(), host)
+	pluginMgr.InitPlugins(ProbeVolumePlugins(), nil /* prober */, host)
 
 	plugin, err := pluginMgr.FindPluginByName(secretPluginName)
 	if err != nil {
@@ -454,7 +505,7 @@ func TestPluginOptional(t *testing.T) {
 		t.Errorf("Got unexpected path: %s", volumePath)
 	}
 
-	err = mounter.SetUp(nil)
+	err = mounter.SetUp(volume.MounterArgs{})
 	if err != nil {
 		t.Errorf("Failed to setup volume: %v", err)
 	}
@@ -477,12 +528,33 @@ func TestPluginOptional(t *testing.T) {
 		}
 	}
 
+	datadirSymlink := filepath.Join(volumePath, "..data")
+	datadir, err := os.Readlink(datadirSymlink)
+	if err != nil && os.IsNotExist(err) {
+		t.Fatalf("couldn't find volume path's data dir, %s", datadirSymlink)
+	} else if err != nil {
+		t.Fatalf("couldn't read symlink, %s", datadirSymlink)
+	}
+	datadirPath := filepath.Join(volumePath, datadir)
+
 	infos, err := ioutil.ReadDir(volumePath)
 	if err != nil {
 		t.Fatalf("couldn't find volume path, %s", volumePath)
 	}
 	if len(infos) != 0 {
-		t.Errorf("empty directory, %s, not found", volumePath)
+		for _, fi := range infos {
+			if fi.Name() != "..data" && fi.Name() != datadir {
+				t.Errorf("empty data volume directory, %s, is not empty. Contains: %s", datadirSymlink, fi.Name())
+			}
+		}
+	}
+
+	infos, err = ioutil.ReadDir(datadirPath)
+	if err != nil {
+		t.Fatalf("couldn't find volume data path, %s", datadirPath)
+	}
+	if len(infos) != 0 {
+		t.Errorf("empty data directory, %s, is not empty. Contains: %s", datadirSymlink, infos[0].Name())
 	}
 
 	defer doTestCleanAndTeardown(plugin, testPodUID, testVolumeName, volumePath, t)
@@ -510,7 +582,7 @@ func TestPluginOptionalKeys(t *testing.T) {
 	}
 	volumeSpec.Secret.Optional = &trueVal
 	defer os.RemoveAll(rootDir)
-	pluginMgr.InitPlugins(ProbeVolumePlugins(), host)
+	pluginMgr.InitPlugins(ProbeVolumePlugins(), nil /* prober */, host)
 
 	plugin, err := pluginMgr.FindPluginByName(secretPluginName)
 	if err != nil {
@@ -531,7 +603,7 @@ func TestPluginOptionalKeys(t *testing.T) {
 		t.Errorf("Got unexpected path: %s", volumePath)
 	}
 
-	err = mounter.SetUp(nil)
+	err = mounter.SetUp(volume.MounterArgs{})
 	if err != nil {
 		t.Errorf("Failed to setup volume: %v", err)
 	}
@@ -594,7 +666,7 @@ func secret(namespace, name string) v1.Secret {
 
 func doTestSecretDataInVolume(volumePath string, secret v1.Secret, t *testing.T) {
 	for key, value := range secret.Data {
-		secretDataHostPath := path.Join(volumePath, key)
+		secretDataHostPath := filepath.Join(volumePath, key)
 		if _, err := os.Stat(secretDataHostPath); err != nil {
 			t.Fatalf("SetUp() failed, couldn't find secret data on disk: %v", secretDataHostPath)
 		} else {
@@ -617,7 +689,7 @@ func doTestCleanAndTeardown(plugin volume.VolumePlugin, podUID types.UID, testVo
 		t.Errorf("Failed to make a new Unmounter: %v", err)
 	}
 	if unmounter == nil {
-		t.Errorf("Got a nil Unmounter")
+		t.Fatalf("Got a nil Unmounter")
 	}
 
 	if err := unmounter.TearDown(); err != nil {
@@ -626,6 +698,6 @@ func doTestCleanAndTeardown(plugin volume.VolumePlugin, podUID types.UID, testVo
 	if _, err := os.Stat(volumePath); err == nil {
 		t.Errorf("TearDown() failed, volume path still exists: %s", volumePath)
 	} else if !os.IsNotExist(err) {
-		t.Errorf("SetUp() failed: %v", err)
+		t.Errorf("TearDown() failed: %v", err)
 	}
 }

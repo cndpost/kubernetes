@@ -17,12 +17,16 @@ limitations under the License.
 package tolerations
 
 import (
-	"k8s.io/kubernetes/pkg/api"
+	api "k8s.io/kubernetes/pkg/apis/core"
 )
 
 type key struct {
 	tolerationKey string
 	effect        api.TaintEffect
+}
+
+func convertTolerationToKey(in api.Toleration) key {
+	return key{in.Key, in.Effect}
 }
 
 // VerifyAgainstWhitelist checks if the provided tolerations
@@ -62,13 +66,14 @@ func IsConflict(first []api.Toleration, second []api.Toleration) bool {
 func MergeTolerations(first []api.Toleration, second []api.Toleration) []api.Toleration {
 	var mergedTolerations []api.Toleration
 	mergedTolerations = append(mergedTolerations, second...)
-
 	firstMap := ConvertTolerationToAMap(first)
 	secondMap := ConvertTolerationToAMap(second)
-
-	for k1, v1 := range firstMap {
-		if _, ok := secondMap[k1]; !ok {
-			mergedTolerations = append(mergedTolerations, v1)
+	// preserve order of first when merging
+	for _, v := range first {
+		k := convertTolerationToKey(v)
+		// if first contains key conflicts, the last one takes precedence
+		if _, ok := secondMap[k]; !ok && firstMap[k] == v {
+			mergedTolerations = append(mergedTolerations, v)
 		}
 	}
 	return mergedTolerations
@@ -95,8 +100,8 @@ func EqualTolerations(first []api.Toleration, second []api.Toleration) bool {
 // ConvertTolerationToAMap converts toleration list into a map[string]api.Toleration
 func ConvertTolerationToAMap(in []api.Toleration) map[key]api.Toleration {
 	out := map[key]api.Toleration{}
-	for i := range in {
-		out[key{in[i].Key, in[i].Effect}] = in[i]
+	for _, v := range in {
+		out[convertTolerationToKey(v)] = v
 	}
 	return out
 }

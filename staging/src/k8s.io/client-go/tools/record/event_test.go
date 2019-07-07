@@ -19,21 +19,20 @@ package record
 import (
 	"encoding/json"
 	"fmt"
-	"math/rand"
 	"net/http"
 	"strconv"
 	"testing"
 	"time"
 
+	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/clock"
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/pkg/api/v1"
-	"k8s.io/client-go/pkg/api/v1/ref"
 	restclient "k8s.io/client-go/rest"
-	"k8s.io/client-go/util/clock"
+	ref "k8s.io/client-go/tools/reference"
 )
 
 type testEventSink struct {
@@ -120,6 +119,9 @@ func TestEventf(t *testing.T) {
 		},
 	}
 	testRef, err := ref.GetPartialReference(scheme.Scheme, testPod, "spec.containers[2]")
+	if err != nil {
+		t.Fatal(err)
+	}
 	testRef2, err := ref.GetPartialReference(scheme.Scheme, testPod2, "spec.containers[3]")
 	if err != nil {
 		t.Fatal(err)
@@ -412,8 +414,8 @@ func TestWriteEventError(t *testing.T) {
 		},
 	}
 
-	eventCorrelator := NewEventCorrelator(clock.RealClock{})
-	randGen := rand.New(rand.NewSource(time.Now().UnixNano()))
+	clock := clock.IntervalClock{Time: time.Now(), Duration: time.Second}
+	eventCorrelator := NewEventCorrelator(&clock)
 
 	for caseName, ent := range table {
 		attempts := 0
@@ -427,7 +429,7 @@ func TestWriteEventError(t *testing.T) {
 			},
 		}
 		ev := &v1.Event{}
-		recordToSink(sink, ev, eventCorrelator, randGen, 0)
+		recordToSink(sink, ev, eventCorrelator, 0)
 		if attempts != ent.attemptsWanted {
 			t.Errorf("case %v: wanted %d, got %d attempts", caseName, ent.attemptsWanted, attempts)
 		}
@@ -435,8 +437,8 @@ func TestWriteEventError(t *testing.T) {
 }
 
 func TestUpdateExpiredEvent(t *testing.T) {
-	eventCorrelator := NewEventCorrelator(clock.RealClock{})
-	randGen := rand.New(rand.NewSource(time.Now().UnixNano()))
+	clock := clock.IntervalClock{Time: time.Now(), Duration: time.Second}
+	eventCorrelator := NewEventCorrelator(&clock)
 
 	var createdEvent *v1.Event
 
@@ -457,7 +459,7 @@ func TestUpdateExpiredEvent(t *testing.T) {
 	ev := &v1.Event{}
 	ev.ResourceVersion = "updated-resource-version"
 	ev.Count = 2
-	recordToSink(sink, ev, eventCorrelator, randGen, 0)
+	recordToSink(sink, ev, eventCorrelator, 0)
 
 	if createdEvent == nil {
 		t.Error("Event did not get created after patch failed")
@@ -497,14 +499,15 @@ func TestLotsOfEvents(t *testing.T) {
 		loggerCalled <- struct{}{}
 	})
 	recorder := eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "eventTest"})
-	ref := &v1.ObjectReference{
-		Kind:       "Pod",
-		Name:       "foo",
-		Namespace:  "baz",
-		UID:        "bar",
-		APIVersion: "version",
-	}
 	for i := 0; i < maxQueuedEvents; i++ {
+		// we want a unique object to stop spam filtering
+		ref := &v1.ObjectReference{
+			Kind:       "Pod",
+			Name:       fmt.Sprintf("foo-%v", i),
+			Namespace:  "baz",
+			UID:        "bar",
+			APIVersion: "version",
+		}
 		// we need to vary the reason to prevent aggregation
 		go recorder.Eventf(ref, v1.EventTypeNormal, "Reason-"+string(i), strconv.Itoa(i))
 	}
@@ -638,6 +641,9 @@ func TestMultiSinkCache(t *testing.T) {
 		},
 	}
 	testRef, err := ref.GetPartialReference(scheme.Scheme, testPod, "spec.containers[2]")
+	if err != nil {
+		t.Fatal(err)
+	}
 	testRef2, err := ref.GetPartialReference(scheme.Scheme, testPod2, "spec.containers[3]")
 	if err != nil {
 		t.Fatal(err)

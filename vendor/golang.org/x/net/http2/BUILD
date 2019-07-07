@@ -1,27 +1,19 @@
-package(default_visibility = ["//visibility:public"])
-
-licenses(["notice"])
-
-load(
-    "@io_bazel_rules_go//go:def.bzl",
-    "go_library",
-)
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "go_default_library",
     srcs = [
+        "ciphers.go",
         "client_conn_pool.go",
-        "configure_transport.go",
+        "databuffer.go",
         "errors.go",
-        "fixed_buffer.go",
         "flow.go",
         "frame.go",
-        "go16.go",
-        "go17.go",
-        "go18.go",
+        "go111.go",
         "gotrack.go",
         "headermap.go",
         "http2.go",
+        "not_go111.go",
         "pipe.go",
         "server.go",
         "transport.go",
@@ -30,11 +22,13 @@ go_library(
         "writesched_priority.go",
         "writesched_random.go",
     ],
-    tags = ["automanaged"],
+    importmap = "k8s.io/kubernetes/vendor/golang.org/x/net/http2",
+    importpath = "golang.org/x/net/http2",
+    visibility = ["//visibility:public"],
     deps = [
+        "//vendor/golang.org/x/net/http/httpguts:go_default_library",
         "//vendor/golang.org/x/net/http2/hpack:go_default_library",
         "//vendor/golang.org/x/net/idna:go_default_library",
-        "//vendor/golang.org/x/net/lex/httplex:go_default_library",
     ],
 )
 
@@ -52,4 +46,5 @@ filegroup(
         "//vendor/golang.org/x/net/http2/hpack:all-srcs",
     ],
     tags = ["automanaged"],
+    visibility = ["//visibility:public"],
 )

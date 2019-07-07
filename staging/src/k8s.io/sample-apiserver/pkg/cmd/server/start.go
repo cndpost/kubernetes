@@ -23,36 +23,53 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apiserver/pkg/admission"
+	"k8s.io/apiserver/pkg/features"
 	genericapiserver "k8s.io/apiserver/pkg/server"
 	genericoptions "k8s.io/apiserver/pkg/server/options"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/sample-apiserver/pkg/admission/plugin/banflunder"
+	"k8s.io/sample-apiserver/pkg/admission/wardleinitializer"
 	"k8s.io/sample-apiserver/pkg/apis/wardle/v1alpha1"
 	"k8s.io/sample-apiserver/pkg/apiserver"
+	clientset "k8s.io/sample-apiserver/pkg/generated/clientset/versioned"
+	informers "k8s.io/sample-apiserver/pkg/generated/informers/externalversions"
 )
 
 const defaultEtcdPathPrefix = "/registry/wardle.kubernetes.io"
 
+// WardleServerOptions contains state for master/api server
 type WardleServerOptions struct {
 	RecommendedOptions *genericoptions.RecommendedOptions
 
-	StdOut io.Writer
-	StdErr io.Writer
+	SharedInformerFactory informers.SharedInformerFactory
+	StdOut                io.Writer
+	StdErr                io.Writer
 }
 
+// NewWardleServerOptions returns a new WardleServerOptions
 func NewWardleServerOptions(out, errOut io.Writer) *WardleServerOptions {
 	o := &WardleServerOptions{
-		RecommendedOptions: genericoptions.NewRecommendedOptions(defaultEtcdPathPrefix, apiserver.Scheme, apiserver.Codecs.LegacyCodec(v1alpha1.SchemeGroupVersion)),
+		RecommendedOptions: genericoptions.NewRecommendedOptions(
+			defaultEtcdPathPrefix,
+			apiserver.Codecs.LegacyCodec(v1alpha1.SchemeGroupVersion),
+			genericoptions.NewProcessInfo("wardle-apiserver", "wardle"),
+		),
 
 		StdOut: out,
 		StdErr: errOut,
 	}
-
+	o.RecommendedOptions.Etcd.StorageConfig.EncodeVersioner = runtime.NewMultiGroupVersioner(v1alpha1.SchemeGroupVersion, schema.GroupKind{Group: v1alpha1.GroupName})
 	return o
 }
 
-// NewCommandStartMaster provides a CLI handler for 'start master' command
-func NewCommandStartWardleServer(out, errOut io.Writer, stopCh <-chan struct{}) *cobra.Command {
-	o := NewWardleServerOptions(out, errOut)
-
+// NewCommandStartWardleServer provides a CLI handler for 'start master' command
+// with a default WardleServerOptions.
+func NewCommandStartWardleServer(defaults *WardleServerOptions, stopCh <-chan struct{}) *cobra.Command {
+	o := *defaults
 	cmd := &cobra.Command{
 		Short: "Launch a wardle API server",
 		Long:  "Launch a wardle API server",
@@ -72,35 +89,61 @@ func NewCommandStartWardleServer(out, errOut io.Writer, stopCh <-chan struct{}) 
 
 	flags := cmd.Flags()
 	o.RecommendedOptions.AddFlags(flags)
+	utilfeature.DefaultMutableFeatureGate.AddFlag(flags)
 
 	return cmd
 }
 
+// Validate validates WardleServerOptions
 func (o WardleServerOptions) Validate(args []string) error {
-	return nil
+	errors := []error{}
+	errors = append(errors, o.RecommendedOptions.Validate()...)
+	return utilerrors.NewAggregate(errors)
 }
 
+// Complete fills in fields required to have valid data
 func (o *WardleServerOptions) Complete() error {
+	// register admission plugins
+	banflunder.Register(o.RecommendedOptions.Admission.Plugins)
+
+	// add admisison plugins to the RecommendedPluginOrder
+	o.RecommendedOptions.Admission.RecommendedPluginOrder = append(o.RecommendedOptions.Admission.RecommendedPluginOrder, "BanFlunder")
+
 	return nil
 }
 
-func (o WardleServerOptions) Config() (*apiserver.Config, error) {
+// Config returns config for the api server given WardleServerOptions
+func (o *WardleServerOptions) Config() (*apiserver.Config, error) {
 	// TODO have a "real" external address
 	if err := o.RecommendedOptions.SecureServing.MaybeDefaultWithSelfSignedCerts("localhost", nil, []net.IP{net.ParseIP("127.0.0.1")}); err != nil {
 		return nil, fmt.Errorf("error creating self-signed certificates: %v", err)
 	}
 
-	serverConfig := genericapiserver.NewConfig(apiserver.Codecs)
+	o.RecommendedOptions.Etcd.StorageConfig.Paging = utilfeature.DefaultFeatureGate.Enabled(features.APIListChunking)
+
+	o.RecommendedOptions.ExtraAdmissionInitializers = func(c *genericapiserver.RecommendedConfig) ([]admission.PluginInitializer, error) {
+		client, err := clientset.NewForConfig(c.LoopbackClientConfig)
+		if err != nil {
+			return nil, err
+		}
+		informerFactory := informers.NewSharedInformerFactory(client, c.LoopbackClientConfig.Timeout)
+		o.SharedInformerFactory = informerFactory
+		return []admission.PluginInitializer{wardleinitializer.New(informerFactory)}, nil
+	}
+
+	serverConfig := genericapiserver.NewRecommendedConfig(apiserver.Codecs)
 	if err := o.RecommendedOptions.ApplyTo(serverConfig); err != nil {
 		return nil, err
 	}
 
 	config := &apiserver.Config{
 		GenericConfig: serverConfig,
+		ExtraConfig:   apiserver.ExtraConfig{},
 	}
 	return config, nil
 }
 
+// RunWardleServer starts a new WardleServer given WardleServerOptions
 func (o WardleServerOptions) RunWardleServer(stopCh <-chan struct{}) error {
 	config, err := o.Config()
 	if err != nil {
@@ -111,5 +154,12 @@ func (o WardleServerOptions) RunWardleServer(stopCh <-chan struct{}) error {
 	if err != nil {
 		return err
 	}
+
+	server.GenericAPIServer.AddPostStartHookOrDie("start-sample-server-informers", func(context genericapiserver.PostStartHookContext) error {
+		config.GenericConfig.SharedInformerFactory.Start(context.StopCh)
+		o.SharedInformerFactory.Start(context.StopCh)
+		return nil
+	})
+
 	return server.GenericAPIServer.PrepareRun().Run(stopCh)
 }

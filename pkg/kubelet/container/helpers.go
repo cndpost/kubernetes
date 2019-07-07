@@ -17,25 +17,20 @@ limitations under the License.
 package container
 
 import (
-	"bytes"
 	"fmt"
-	"hash/adler32"
 	"hash/fnv"
 	"strings"
-	"time"
 
-	"github.com/golang/glog"
+	"k8s.io/klog"
 
+	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	clientv1 "k8s.io/client-go/pkg/api/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/record"
-	"k8s.io/kubernetes/pkg/api/v1"
-	runtimeapi "k8s.io/kubernetes/pkg/kubelet/api/v1alpha1/runtime"
-	"k8s.io/kubernetes/pkg/kubelet/events"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 	"k8s.io/kubernetes/pkg/kubelet/util/format"
-	"k8s.io/kubernetes/pkg/kubelet/util/ioutils"
 	hashutil "k8s.io/kubernetes/pkg/util/hash"
 	"k8s.io/kubernetes/third_party/forked/golang/expansion"
 )
@@ -48,9 +43,9 @@ type HandlerRunner interface {
 // RuntimeHelper wraps kubelet to make container runtime
 // able to get necessary informations like the RunContainerOptions, DNS settings, Host IP.
 type RuntimeHelper interface {
-	GenerateRunContainerOptions(pod *v1.Pod, container *v1.Container, podIP string) (contOpts *RunContainerOptions, useClusterFirstPolicy bool, err error)
-	GetClusterDNS(pod *v1.Pod) (dnsServers []string, dnsSearches []string, useClusterFirstPolicy bool, err error)
-	// GetPodCgroupParent returns the the CgroupName identifer, and its literal cgroupfs form on the host
+	GenerateRunContainerOptions(pod *v1.Pod, container *v1.Container, podIP string) (contOpts *RunContainerOptions, cleanupAction func(), err error)
+	GetPodDNS(pod *v1.Pod) (dnsConfig *runtimeapi.DNSConfig, err error)
+	// GetPodCgroupParent returns the CgroupName identifier, and its literal cgroupfs form on the host
 	// of a pod.
 	GetPodCgroupParent(pod *v1.Pod) string
 	GetPodDir(podUID types.UID) string
@@ -81,13 +76,13 @@ func ShouldContainerBeRestarted(container *v1.Container, pod *v1.Pod, podStatus 
 	}
 	// Check RestartPolicy for dead container
 	if pod.Spec.RestartPolicy == v1.RestartPolicyNever {
-		glog.V(4).Infof("Already ran container %q of pod %q, do nothing", container.Name, format.Pod(pod))
+		klog.V(4).Infof("Already ran container %q of pod %q, do nothing", container.Name, format.Pod(pod))
 		return false
 	}
 	if pod.Spec.RestartPolicy == v1.RestartPolicyOnFailure {
 		// Check the exit code.
 		if status.ExitCode == 0 {
-			glog.V(4).Infof("Already successfully ran container %q of pod %q, do nothing", container.Name, format.Pod(pod))
+			klog.V(4).Infof("Already successfully ran container %q of pod %q, do nothing", container.Name, format.Pod(pod))
 			return false
 		}
 	}
@@ -98,15 +93,6 @@ func ShouldContainerBeRestarted(container *v1.Container, pod *v1.Pod, podStatus 
 // the running container with its desired spec.
 func HashContainer(container *v1.Container) uint64 {
 	hash := fnv.New32a()
-	hashutil.DeepHashObject(hash, *container)
-	return uint64(hash.Sum32())
-}
-
-// HashContainerLegacy returns the hash of the container. It is used to compare
-// the running container with its desired spec.
-// TODO: Delete this function after we deprecate dockertools.
-func HashContainerLegacy(container *v1.Container) uint64 {
-	hash := adler32.New()
 	hashutil.DeepHashObject(hash, *container)
 	return uint64(hash.Sum32())
 }
@@ -145,6 +131,24 @@ func ExpandContainerCommandOnlyStatic(containerCommand []string, envs []v1.EnvVa
 	return command
 }
 
+func ExpandContainerVolumeMounts(mount v1.VolumeMount, envs []EnvVar) (string, error) {
+
+	envmap := EnvVarsToMap(envs)
+	missingKeys := sets.NewString()
+	expanded := expansion.Expand(mount.SubPathExpr, func(key string) string {
+		value, ok := envmap[key]
+		if !ok || len(value) == 0 {
+			missingKeys.Insert(key)
+		}
+		return value
+	})
+
+	if len(missingKeys) > 0 {
+		return "", fmt.Errorf("missing value for %s", strings.Join(missingKeys.List(), ", "))
+	}
+	return expanded, nil
+}
+
 func ExpandContainerCommandAndArgs(container *v1.Container, envs []EnvVar) (command []string, args []string) {
 	mapping := expansion.MappingFuncFor(EnvVarsToMap(envs))
 
@@ -174,19 +178,13 @@ type innerEventRecorder struct {
 	recorder record.EventRecorder
 }
 
-func (irecorder *innerEventRecorder) shouldRecordEvent(object runtime.Object) (*clientv1.ObjectReference, bool) {
+func (irecorder *innerEventRecorder) shouldRecordEvent(object runtime.Object) (*v1.ObjectReference, bool) {
 	if object == nil {
 		return nil, false
 	}
-	if ref, ok := object.(*clientv1.ObjectReference); ok {
-		if !strings.HasPrefix(ref.FieldPath, ImplicitContainerPrefix) {
-			return ref, true
-		}
-	}
-	// just in case we miss a spot, be sure that we still log something
 	if ref, ok := object.(*v1.ObjectReference); ok {
 		if !strings.HasPrefix(ref.FieldPath, ImplicitContainerPrefix) {
-			return events.ToObjectReference(ref), true
+			return ref, true
 		}
 	}
 	return nil, false
@@ -209,6 +207,13 @@ func (irecorder *innerEventRecorder) PastEventf(object runtime.Object, timestamp
 	if ref, ok := irecorder.shouldRecordEvent(object); ok {
 		irecorder.recorder.PastEventf(ref, timestamp, eventtype, reason, messageFmt, args...)
 	}
+}
+
+func (irecorder *innerEventRecorder) AnnotatedEventf(object runtime.Object, annotations map[string]string, eventtype, reason, messageFmt string, args ...interface{}) {
+	if ref, ok := irecorder.shouldRecordEvent(object); ok {
+		irecorder.recorder.AnnotatedEventf(ref, annotations, eventtype, reason, messageFmt, args...)
+	}
+
 }
 
 // Pod must not be nil.
@@ -271,26 +276,6 @@ func FormatPod(pod *Pod) string {
 	return fmt.Sprintf("%s_%s(%s)", pod.Name, pod.Namespace, pod.ID)
 }
 
-type containerCommandRunnerWrapper struct {
-	DirectStreamingRuntime
-}
-
-var _ ContainerCommandRunner = &containerCommandRunnerWrapper{}
-
-func DirectStreamingRunner(runtime DirectStreamingRuntime) ContainerCommandRunner {
-	return &containerCommandRunnerWrapper{runtime}
-}
-
-func (r *containerCommandRunnerWrapper) RunInContainer(id ContainerID, cmd []string, timeout time.Duration) ([]byte, error) {
-	var buffer bytes.Buffer
-	output := ioutils.WriteCloserWrapper(&buffer)
-	err := r.ExecInContainer(id, cmd, nil, output, output, false, nil, timeout)
-	// Even if err is non-nil, there still may be output (e.g. the exec wrote to stdout or stderr but
-	// the command returned a nonzero exit code). Therefore, always return the output along with the
-	// error.
-	return buffer.Bytes(), err
-}
-
 // GetContainerSpec gets the container spec by containerName.
 func GetContainerSpec(pod *v1.Pod, containerName string) *v1.Container {
 	for i, c := range pod.Spec.Containers {
@@ -308,7 +293,7 @@ func GetContainerSpec(pod *v1.Pod, containerName string) *v1.Container {
 
 // HasPrivilegedContainer returns true if any of the containers in the pod are privileged.
 func HasPrivilegedContainer(pod *v1.Pod) bool {
-	for _, c := range pod.Spec.Containers {
+	for _, c := range append(pod.Spec.Containers, pod.Spec.InitContainers...) {
 		if c.SecurityContext != nil &&
 			c.SecurityContext.Privileged != nil &&
 			*c.SecurityContext.Privileged {
@@ -316,21 +301,6 @@ func HasPrivilegedContainer(pod *v1.Pod) bool {
 		}
 	}
 	return false
-}
-
-// MakeCapabilities creates string slices from Capability slices
-func MakeCapabilities(capAdd []v1.Capability, capDrop []v1.Capability) ([]string, []string) {
-	var (
-		addCaps  []string
-		dropCaps []string
-	)
-	for _, cap := range capAdd {
-		addCaps = append(addCaps, string(cap))
-	}
-	for _, cap := range capDrop {
-		dropCaps = append(dropCaps, string(cap))
-	}
-	return addCaps, dropCaps
 }
 
 // MakePortMappings creates internal port mapping from api port mapping.
@@ -355,7 +325,7 @@ func MakePortMappings(container *v1.Container) (ports []PortMapping) {
 
 		// Protect against exposing the same protocol-port more than once in a container.
 		if _, ok := names[pm.Name]; ok {
-			glog.Warningf("Port name conflicted, %q is defined more than once", pm.Name)
+			klog.Warningf("Port name conflicted, %q is defined more than once", pm.Name)
 			continue
 		}
 		ports = append(ports, pm)

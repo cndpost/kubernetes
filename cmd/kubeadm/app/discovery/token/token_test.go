@@ -17,45 +17,56 @@ limitations under the License.
 package token
 
 import (
-	"strconv"
 	"testing"
 	"time"
 
+	"github.com/pkg/errors"
+
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
-	kubeconfigutil "k8s.io/kubernetes/cmd/kubeadm/app/util/kubeconfig"
 )
 
-func TestRunForEndpointsAndReturnFirst(t *testing.T) {
+func TestFetchKubeConfigWithTimeout(t *testing.T) {
+	const testAPIEndpoint = "sample-endpoint:1234"
 	tests := []struct {
-		endpoints        []string
-		expectedEndpoint string
+		name             string
+		discoveryTimeout time.Duration
+		shouldFail       bool
 	}{
 		{
-			endpoints:        []string{"1", "2", "3"},
-			expectedEndpoint: "1",
+			name:             "Timeout if value is not returned on time",
+			discoveryTimeout: 1 * time.Second,
+			shouldFail:       true,
 		},
 		{
-			endpoints:        []string{"6", "5"},
-			expectedEndpoint: "5",
-		},
-		{
-			endpoints:        []string{"10", "4"},
-			expectedEndpoint: "4",
+			name:             "Don't timeout if value is returned on time",
+			discoveryTimeout: 5 * time.Second,
+			shouldFail:       false,
 		},
 	}
-	for _, rt := range tests {
-		returnKubeConfig := runForEndpointsAndReturnFirst(rt.endpoints, func(endpoint string) (*clientcmdapi.Config, error) {
-			timeout, _ := strconv.Atoi(endpoint)
-			time.Sleep(time.Second * time.Duration(timeout))
-			return kubeconfigutil.CreateBasic(endpoint, "foo", "foo", []byte{}), nil
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg, err := fetchKubeConfigWithTimeout(testAPIEndpoint, test.discoveryTimeout, func(apiEndpoint string) (*clientcmdapi.Config, error) {
+				if apiEndpoint != testAPIEndpoint {
+					return nil, errors.Errorf("unexpected API server endpoint:\n\texpected: %q\n\tgot: %q", testAPIEndpoint, apiEndpoint)
+				}
+
+				time.Sleep(3 * time.Second)
+				return &clientcmdapi.Config{}, nil
+			})
+
+			if test.shouldFail {
+				if err == nil {
+					t.Fatal("unexpected success")
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("unexpected failure: %v", err)
+				}
+				if cfg == nil {
+					t.Fatal("cfg is nil")
+				}
+			}
 		})
-		endpoint := returnKubeConfig.Clusters[returnKubeConfig.Contexts[returnKubeConfig.CurrentContext].Cluster].Server
-		if endpoint != rt.expectedEndpoint {
-			t.Errorf(
-				"failed TestRunForEndpointsAndReturnFirst:\n\texpected: %s\n\t  actual: %s",
-				endpoint,
-				rt.expectedEndpoint,
-			)
-		}
 	}
 }

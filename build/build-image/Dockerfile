@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # This file creates a standard build environment for building Kubernetes
-FROM gcr.io/google_containers/kube-cross:KUBE_BUILD_IMAGE_CROSS_TAG
+FROM k8s.gcr.io/kube-cross:KUBE_BUILD_IMAGE_CROSS_TAG
 
 # Mark this as a kube-build container
 RUN touch /kube-build-image
@@ -35,6 +35,13 @@ ENV KUBE_OUTPUT_SUBPATH _output/dockerized
 
 # Pick up version stuff here as we don't copy our .git over.
 ENV KUBE_GIT_VERSION_FILE ${HOME}/.dockerized-kube-version-defs
+
+# Add system-wide git user information
+RUN git config --system user.email "nobody@k8s.io" \
+  && git config --system user.name "kube-build-image"
+
+# Fix permissions on gopath
+RUN chmod -R a+rwx $GOPATH
 
 # Make log messages use the right timezone
 ADD localtime /etc/localtime

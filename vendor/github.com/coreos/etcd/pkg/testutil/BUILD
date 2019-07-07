@@ -1,21 +1,17 @@
-package(default_visibility = ["//visibility:public"])
-
-licenses(["notice"])
-
-load(
-    "@io_bazel_rules_go//go:def.bzl",
-    "go_library",
-)
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "go_default_library",
     srcs = [
+        "assert.go",
         "leak.go",
         "pauseable_handler.go",
         "recorder.go",
         "testutil.go",
     ],
-    tags = ["automanaged"],
+    importmap = "k8s.io/kubernetes/vendor/github.com/coreos/etcd/pkg/testutil",
+    importpath = "github.com/coreos/etcd/pkg/testutil",
+    visibility = ["//visibility:public"],
 )
 
 filegroup(
@@ -29,4 +25,5 @@ filegroup(
     name = "all-srcs",
     srcs = [":package-srcs"],
     tags = ["automanaged"],
+    visibility = ["//visibility:public"],
 )

@@ -18,7 +18,7 @@ package container
 
 import (
 	"k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/kubernetes/pkg/client/unversioned/remotecommand"
+	"k8s.io/client-go/tools/remotecommand"
 )
 
 // handleResizing spawns a goroutine that processes the resize channel, calling resizeFunc for each
@@ -32,11 +32,7 @@ func HandleResizing(resize <-chan remotecommand.TerminalSize, resizeFunc func(si
 	go func() {
 		defer runtime.HandleCrash()
 
-		for {
-			size, ok := <-resize
-			if !ok {
-				return
-			}
+		for size := range resize {
 			if size.Height < 1 || size.Width < 1 {
 				continue
 			}

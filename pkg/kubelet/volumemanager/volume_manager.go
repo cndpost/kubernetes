@@ -18,51 +18,49 @@ package volumemanager
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"time"
 
-	"github.com/golang/glog"
+	"k8s.io/api/core/v1"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
+	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/record"
-	"k8s.io/kubernetes/pkg/api/v1"
-	"k8s.io/kubernetes/pkg/client/clientset_generated/clientset"
+	"k8s.io/klog"
 	"k8s.io/kubernetes/pkg/kubelet/config"
 	"k8s.io/kubernetes/pkg/kubelet/container"
-	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/pkg/kubelet/pod"
 	"k8s.io/kubernetes/pkg/kubelet/status"
 	"k8s.io/kubernetes/pkg/kubelet/util/format"
 	"k8s.io/kubernetes/pkg/kubelet/volumemanager/cache"
+	"k8s.io/kubernetes/pkg/kubelet/volumemanager/metrics"
 	"k8s.io/kubernetes/pkg/kubelet/volumemanager/populator"
 	"k8s.io/kubernetes/pkg/kubelet/volumemanager/reconciler"
 	"k8s.io/kubernetes/pkg/util/mount"
 	"k8s.io/kubernetes/pkg/volume"
+	"k8s.io/kubernetes/pkg/volume/util"
 	"k8s.io/kubernetes/pkg/volume/util/operationexecutor"
 	"k8s.io/kubernetes/pkg/volume/util/types"
-	"k8s.io/kubernetes/pkg/volume/util/volumehelper"
+	"k8s.io/kubernetes/pkg/volume/util/volumepathhandler"
 )
 
 const (
 	// reconcilerLoopSleepPeriod is the amount of time the reconciler loop waits
 	// between successive executions
-	reconcilerLoopSleepPeriod time.Duration = 100 * time.Millisecond
-
-	// reconcilerSyncStatesSleepPeriod is the amount of time the reconciler reconstruct process
-	// waits between successive executions
-	reconcilerSyncStatesSleepPeriod time.Duration = 3 * time.Minute
+	reconcilerLoopSleepPeriod = 100 * time.Millisecond
 
 	// desiredStateOfWorldPopulatorLoopSleepPeriod is the amount of time the
 	// DesiredStateOfWorldPopulator loop waits between successive executions
-	desiredStateOfWorldPopulatorLoopSleepPeriod time.Duration = 100 * time.Millisecond
+	desiredStateOfWorldPopulatorLoopSleepPeriod = 100 * time.Millisecond
 
 	// desiredStateOfWorldPopulatorGetPodStatusRetryDuration is the amount of
 	// time the DesiredStateOfWorldPopulator loop waits between successive pod
 	// cleanup calls (to prevent calling containerruntime.GetPodStatus too
 	// frequently).
-	desiredStateOfWorldPopulatorGetPodStatusRetryDuration time.Duration = 2 * time.Second
+	desiredStateOfWorldPopulatorGetPodStatusRetryDuration = 2 * time.Second
 
 	// podAttachAndMountTimeout is the maximum amount of time the
 	// WaitForAttachAndMount call will wait for all volumes in the specified pod
@@ -73,11 +71,11 @@ const (
 	// request to the pod).
 	// Value is slightly offset from 2 minutes to make timeouts due to this
 	// constant recognizable.
-	podAttachAndMountTimeout time.Duration = 2*time.Minute + 3*time.Second
+	podAttachAndMountTimeout = 2*time.Minute + 3*time.Second
 
 	// podAttachAndMountRetryInterval is the amount of time the GetVolumesForPod
 	// call waits before retrying
-	podAttachAndMountRetryInterval time.Duration = 300 * time.Millisecond
+	podAttachAndMountRetryInterval = 300 * time.Millisecond
 
 	// waitForAttachTimeout is the maximum amount of time a
 	// operationexecutor.Mount call will wait for a volume to be attached.
@@ -85,7 +83,7 @@ const (
 	// minutes to complete for some volume plugins in some cases. While this
 	// operation is waiting it only blocks other operations on the same device,
 	// other devices are not affected.
-	waitForAttachTimeout time.Duration = 10 * time.Minute
+	waitForAttachTimeout = 10 * time.Minute
 )
 
 // VolumeManager runs a set of asynchronous loops that figure out which volumes
@@ -151,12 +149,13 @@ func NewVolumeManager(
 	podStatusProvider status.PodStatusProvider,
 	kubeClient clientset.Interface,
 	volumePluginMgr *volume.VolumePluginMgr,
-	kubeContainerRuntime kubecontainer.Runtime,
+	kubeContainerRuntime container.Runtime,
 	mounter mount.Interface,
+	hostutil mount.HostUtils,
 	kubeletPodsDir string,
 	recorder record.EventRecorder,
 	checkNodeCapabilitiesBeforeMount bool,
-	keepTerminatedPodVolumes bool) (VolumeManager, error) {
+	keepTerminatedPodVolumes bool) VolumeManager {
 
 	vm := &volumeManager{
 		kubeClient:          kubeClient,
@@ -167,23 +166,10 @@ func NewVolumeManager(
 			kubeClient,
 			volumePluginMgr,
 			recorder,
-			checkNodeCapabilitiesBeforeMount),
-		),
+			checkNodeCapabilitiesBeforeMount,
+			volumepathhandler.NewBlockVolumePathHandler())),
 	}
 
-	vm.reconciler = reconciler.NewReconciler(
-		kubeClient,
-		controllerAttachDetachEnabled,
-		reconcilerLoopSleepPeriod,
-		reconcilerSyncStatesSleepPeriod,
-		waitForAttachTimeout,
-		nodeName,
-		vm.desiredStateOfWorld,
-		vm.actualStateOfWorld,
-		vm.operationExecutor,
-		mounter,
-		volumePluginMgr,
-		kubeletPodsDir)
 	vm.desiredStateOfWorldPopulator = populator.NewDesiredStateOfWorldPopulator(
 		kubeClient,
 		desiredStateOfWorldPopulatorLoopSleepPeriod,
@@ -191,10 +177,25 @@ func NewVolumeManager(
 		podManager,
 		podStatusProvider,
 		vm.desiredStateOfWorld,
+		vm.actualStateOfWorld,
 		kubeContainerRuntime,
 		keepTerminatedPodVolumes)
+	vm.reconciler = reconciler.NewReconciler(
+		kubeClient,
+		controllerAttachDetachEnabled,
+		reconcilerLoopSleepPeriod,
+		waitForAttachTimeout,
+		nodeName,
+		vm.desiredStateOfWorld,
+		vm.actualStateOfWorld,
+		vm.desiredStateOfWorldPopulator.HasAddedPods,
+		vm.operationExecutor,
+		mounter,
+		hostutil,
+		volumePluginMgr,
+		kubeletPodsDir)
 
-	return vm, nil
+	return vm
 }
 
 // volumeManager implements the VolumeManager interface
@@ -238,27 +239,38 @@ type volumeManager struct {
 func (vm *volumeManager) Run(sourcesReady config.SourcesReady, stopCh <-chan struct{}) {
 	defer runtime.HandleCrash()
 
-	go vm.desiredStateOfWorldPopulator.Run(stopCh)
-	glog.V(2).Infof("The desired_state_of_world populator starts")
+	go vm.desiredStateOfWorldPopulator.Run(sourcesReady, stopCh)
+	klog.V(2).Infof("The desired_state_of_world populator starts")
 
-	glog.Infof("Starting Kubelet Volume Manager")
-	go vm.reconciler.Run(sourcesReady, stopCh)
+	klog.Infof("Starting Kubelet Volume Manager")
+	go vm.reconciler.Run(stopCh)
+
+	metrics.Register(vm.actualStateOfWorld, vm.desiredStateOfWorld, vm.volumePluginMgr)
+
+	if vm.kubeClient != nil {
+		// start informer for CSIDriver
+		vm.volumePluginMgr.Run(stopCh)
+	}
 
 	<-stopCh
-	glog.Infof("Shutting down Kubelet Volume Manager")
+	klog.Infof("Shutting down Kubelet Volume Manager")
 }
 
-func (vm *volumeManager) GetMountedVolumesForPod(
-	podName types.UniquePodName) container.VolumeMap {
+func (vm *volumeManager) GetMountedVolumesForPod(podName types.UniquePodName) container.VolumeMap {
 	podVolumes := make(container.VolumeMap)
 	for _, mountedVolume := range vm.actualStateOfWorld.GetMountedVolumesForPod(podName) {
-		podVolumes[mountedVolume.OuterVolumeSpecName] = container.VolumeInfo{Mounter: mountedVolume.Mounter}
+		podVolumes[mountedVolume.OuterVolumeSpecName] = container.VolumeInfo{
+			Mounter:             mountedVolume.Mounter,
+			BlockVolumeMapper:   mountedVolume.BlockVolumeMapper,
+			ReadOnly:            mountedVolume.VolumeSpec.ReadOnly,
+			InnerVolumeSpecName: mountedVolume.InnerVolumeSpecName,
+		}
 	}
 	return podVolumes
 }
 
 func (vm *volumeManager) GetExtraSupplementalGroupsForPod(pod *v1.Pod) []int64 {
-	podName := volumehelper.GetUniquePodName(pod)
+	podName := util.GetUniquePodName(pod)
 	supplementalGroups := sets.NewString()
 
 	for _, mountedVolume := range vm.actualStateOfWorld.GetMountedVolumesForPod(podName) {
@@ -285,16 +297,9 @@ func (vm *volumeManager) GetVolumesInUse() []v1.UniqueVolumeName {
 	// that volumes are marked in use as soon as the decision is made that the
 	// volume *should* be attached to this node until it is safely unmounted.
 	desiredVolumes := vm.desiredStateOfWorld.GetVolumesToMount()
-	mountedVolumes := vm.actualStateOfWorld.GetGloballyMountedVolumes()
-	volumesToReportInUse :=
-		make(
-			[]v1.UniqueVolumeName,
-			0, /* len */
-			len(desiredVolumes)+len(mountedVolumes) /* cap */)
-	desiredVolumesMap :=
-		make(
-			map[v1.UniqueVolumeName]bool,
-			len(desiredVolumes)+len(mountedVolumes) /* cap */)
+	allAttachedVolumes := vm.actualStateOfWorld.GetAttachedVolumes()
+	volumesToReportInUse := make([]v1.UniqueVolumeName, 0, len(desiredVolumes)+len(allAttachedVolumes))
+	desiredVolumesMap := make(map[v1.UniqueVolumeName]bool, len(desiredVolumes)+len(allAttachedVolumes))
 
 	for _, volume := range desiredVolumes {
 		if volume.PluginIsAttachable {
@@ -305,7 +310,7 @@ func (vm *volumeManager) GetVolumesInUse() []v1.UniqueVolumeName {
 		}
 	}
 
-	for _, volume := range mountedVolumes {
+	for _, volume := range allAttachedVolumes {
 		if volume.PluginIsAttachable {
 			if _, exists := desiredVolumesMap[volume.VolumeName]; !exists {
 				volumesToReportInUse = append(volumesToReportInUse, volume.VolumeName)
@@ -313,6 +318,9 @@ func (vm *volumeManager) GetVolumesInUse() []v1.UniqueVolumeName {
 		}
 	}
 
+	sort.Slice(volumesToReportInUse, func(i, j int) bool {
+		return string(volumesToReportInUse[i]) < string(volumesToReportInUse[j])
+	})
 	return volumesToReportInUse
 }
 
@@ -331,22 +339,25 @@ func (vm *volumeManager) MarkVolumesAsReportedInUse(
 }
 
 func (vm *volumeManager) WaitForAttachAndMount(pod *v1.Pod) error {
+	if pod == nil {
+		return nil
+	}
+
 	expectedVolumes := getExpectedVolumes(pod)
 	if len(expectedVolumes) == 0 {
 		// No volumes to verify
 		return nil
 	}
 
-	glog.V(3).Infof("Waiting for volumes to attach and mount for pod %q", format.Pod(pod))
-	uniquePodName := volumehelper.GetUniquePodName(pod)
+	klog.V(3).Infof("Waiting for volumes to attach and mount for pod %q", format.Pod(pod))
+	uniquePodName := util.GetUniquePodName(pod)
 
 	// Some pods expect to have Setup called over and over again to update.
 	// Remount plugins for which this is true. (Atomically updating volumes,
 	// like Downward API, depend on this to update the contents of the volume).
 	vm.desiredStateOfWorldPopulator.ReprocessPod(uniquePodName)
-	vm.actualStateOfWorld.MarkRemountRequired(uniquePodName)
 
-	err := wait.Poll(
+	err := wait.PollImmediate(
 		podAttachAndMountRetryInterval,
 		podAttachAndMountTimeout,
 		vm.verifyVolumesMountedFunc(uniquePodName, expectedVolumes))
@@ -355,25 +366,41 @@ func (vm *volumeManager) WaitForAttachAndMount(pod *v1.Pod) error {
 		// Timeout expired
 		unmountedVolumes :=
 			vm.getUnmountedVolumes(uniquePodName, expectedVolumes)
+		// Also get unattached volumes for error message
+		unattachedVolumes :=
+			vm.getUnattachedVolumes(expectedVolumes)
+
 		if len(unmountedVolumes) == 0 {
 			return nil
 		}
 
 		return fmt.Errorf(
-			"timeout expired waiting for volumes to attach/mount for pod %q/%q. list of unattached/unmounted volumes=%v",
+			"timeout expired waiting for volumes to attach or mount for pod %q/%q. list of unmounted volumes=%v. list of unattached volumes=%v",
 			pod.Namespace,
 			pod.Name,
-			unmountedVolumes)
+			unmountedVolumes,
+			unattachedVolumes)
 	}
 
-	glog.V(3).Infof("All volumes are attached and mounted for pod %q", format.Pod(pod))
+	klog.V(3).Infof("All volumes are attached and mounted for pod %q", format.Pod(pod))
 	return nil
+}
+
+// getUnattachedVolumes returns a list of the volumes that are expected to be attached but
+// are not currently attached to the node
+func (vm *volumeManager) getUnattachedVolumes(expectedVolumes []string) []string {
+	unattachedVolumes := []string{}
+	for _, volume := range expectedVolumes {
+		if !vm.actualStateOfWorld.VolumeExists(v1.UniqueVolumeName(volume)) {
+			unattachedVolumes = append(unattachedVolumes, volume)
+		}
+	}
+	return unattachedVolumes
 }
 
 // verifyVolumesMountedFunc returns a method that returns true when all expected
 // volumes are mounted.
-func (vm *volumeManager) verifyVolumesMountedFunc(
-	podName types.UniquePodName, expectedVolumes []string) wait.ConditionFunc {
+func (vm *volumeManager) verifyVolumesMountedFunc(podName types.UniquePodName, expectedVolumes []string) wait.ConditionFunc {
 	return func() (done bool, err error) {
 		return len(vm.getUnmountedVolumes(podName, expectedVolumes)) == 0, nil
 	}
@@ -382,8 +409,7 @@ func (vm *volumeManager) verifyVolumesMountedFunc(
 // getUnmountedVolumes fetches the current list of mounted volumes from
 // the actual state of the world, and uses it to process the list of
 // expectedVolumes. It returns a list of unmounted volumes.
-func (vm *volumeManager) getUnmountedVolumes(
-	podName types.UniquePodName, expectedVolumes []string) []string {
+func (vm *volumeManager) getUnmountedVolumes(podName types.UniquePodName, expectedVolumes []string) []string {
 	mountedVolumes := sets.NewString()
 	for _, mountedVolume := range vm.actualStateOfWorld.GetMountedVolumesForPod(podName) {
 		mountedVolumes.Insert(mountedVolume.OuterVolumeSpecName)
@@ -393,8 +419,7 @@ func (vm *volumeManager) getUnmountedVolumes(
 
 // filterUnmountedVolumes adds each element of expectedVolumes that is not in
 // mountedVolumes to a list of unmountedVolumes and returns it.
-func filterUnmountedVolumes(
-	mountedVolumes sets.String, expectedVolumes []string) []string {
+func filterUnmountedVolumes(mountedVolumes sets.String, expectedVolumes []string) []string {
 	unmountedVolumes := []string{}
 	for _, expectedVolume := range expectedVolumes {
 		if !mountedVolumes.Has(expectedVolume) {
@@ -408,9 +433,6 @@ func filterUnmountedVolumes(
 // consider the volume setup step for this pod satisfied.
 func getExpectedVolumes(pod *v1.Pod) []string {
 	expectedVolumes := []string{}
-	if pod == nil {
-		return expectedVolumes
-	}
 
 	for _, podVolume := range pod.Spec.Volumes {
 		expectedVolumes = append(expectedVolumes, podVolume.Name)
@@ -434,7 +456,7 @@ func getExtraSupplementalGid(volumeGidValue string, pod *v1.Pod) (int64, bool) {
 
 	if pod.Spec.SecurityContext != nil {
 		for _, existingGid := range pod.Spec.SecurityContext.SupplementalGroups {
-			if gid == existingGid {
+			if gid == int64(existingGid) {
 				return 0, false
 			}
 		}

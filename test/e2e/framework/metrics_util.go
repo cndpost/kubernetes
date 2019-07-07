@@ -23,17 +23,22 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/kubernetes/pkg/client/clientset_generated/clientset"
+	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/kubernetes/pkg/master/ports"
-	"k8s.io/kubernetes/pkg/metrics"
+	schedulermetric "k8s.io/kubernetes/pkg/scheduler/metrics"
 	"k8s.io/kubernetes/pkg/util/system"
+	e2elog "k8s.io/kubernetes/test/e2e/framework/log"
+	"k8s.io/kubernetes/test/e2e/framework/metrics"
+	e2essh "k8s.io/kubernetes/test/e2e/framework/ssh"
 
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
@@ -43,102 +48,158 @@ const (
 	// NodeStartupThreshold is a rough estimate of the time allocated for a pod to start on a node.
 	NodeStartupThreshold = 4 * time.Second
 
-	podStartupThreshold time.Duration = 5 * time.Second
 	// We are setting 1s threshold for apicalls even in small clusters to avoid flakes.
 	// The problem is that if long GC is happening in small clusters (where we have e.g.
 	// 1-core master machines) and tests are pretty short, it may consume significant
 	// portion of CPU and basically stop all the real work.
 	// Increasing threshold to 1s is within our SLO and should solve this problem.
 	apiCallLatencyThreshold time.Duration = 1 * time.Second
+
+	// We use a higher threshold for list apicalls if the cluster is big (i.e having > 500 nodes)
+	// as list response sizes are bigger in general for big clusters. We also use a higher threshold
+	// for list calls at cluster scope (this includes non-namespaced and all-namespaced calls).
+	apiListCallLatencyThreshold      time.Duration = 5 * time.Second
+	apiClusterScopeListCallThreshold time.Duration = 10 * time.Second
+	bigClusterNodeCountThreshold                   = 500
+
+	// Cluster Autoscaler metrics names
+	caFunctionMetric      = "cluster_autoscaler_function_duration_seconds_bucket"
+	caFunctionMetricLabel = "function"
 )
 
-type MetricsForE2E metrics.MetricsCollection
+// MetricsForE2E is metrics collection of components.
+type MetricsForE2E metrics.Collection
 
 func (m *MetricsForE2E) filterMetrics() {
-	interestingApiServerMetrics := make(metrics.ApiServerMetrics)
-	for _, metric := range InterestingApiServerMetrics {
-		interestingApiServerMetrics[metric] = (*m).ApiServerMetrics[metric]
+	apiServerMetrics := make(metrics.APIServerMetrics)
+	for _, metric := range interestingAPIServerMetrics {
+		apiServerMetrics[metric] = (*m).APIServerMetrics[metric]
 	}
-	interestingControllerManagerMetrics := make(metrics.ControllerManagerMetrics)
-	for _, metric := range InterestingControllerManagerMetrics {
-		interestingControllerManagerMetrics[metric] = (*m).ControllerManagerMetrics[metric]
+	controllerManagerMetrics := make(metrics.ControllerManagerMetrics)
+	for _, metric := range interestingControllerManagerMetrics {
+		controllerManagerMetrics[metric] = (*m).ControllerManagerMetrics[metric]
 	}
-	interestingKubeletMetrics := make(map[string]metrics.KubeletMetrics)
+	kubeletMetrics := make(map[string]metrics.KubeletMetrics)
 	for kubelet, grabbed := range (*m).KubeletMetrics {
-		interestingKubeletMetrics[kubelet] = make(metrics.KubeletMetrics)
-		for _, metric := range InterestingKubeletMetrics {
-			interestingKubeletMetrics[kubelet][metric] = grabbed[metric]
+		kubeletMetrics[kubelet] = make(metrics.KubeletMetrics)
+		for _, metric := range interestingKubeletMetrics {
+			kubeletMetrics[kubelet][metric] = grabbed[metric]
 		}
 	}
-	(*m).ApiServerMetrics = interestingApiServerMetrics
-	(*m).ControllerManagerMetrics = interestingControllerManagerMetrics
-	(*m).KubeletMetrics = interestingKubeletMetrics
+	(*m).APIServerMetrics = apiServerMetrics
+	(*m).ControllerManagerMetrics = controllerManagerMetrics
+	(*m).KubeletMetrics = kubeletMetrics
 }
 
+func printSample(sample *model.Sample) string {
+	buf := make([]string, 0)
+	// Id is a VERY special label. For 'normal' container it's useless, but it's necessary
+	// for 'system' containers (e.g. /docker-daemon, /kubelet, etc.). We know if that's the
+	// case by checking if there's a label "kubernetes_container_name" present. It's hacky
+	// but it works...
+	_, normalContainer := sample.Metric["kubernetes_container_name"]
+	for k, v := range sample.Metric {
+		if strings.HasPrefix(string(k), "__") {
+			continue
+		}
+
+		if string(k) == "id" && normalContainer {
+			continue
+		}
+		buf = append(buf, fmt.Sprintf("%v=%v", string(k), v))
+	}
+	return fmt.Sprintf("[%v] = %v", strings.Join(buf, ","), sample.Value)
+}
+
+// PrintHumanReadable returns e2e metrics with JSON format.
 func (m *MetricsForE2E) PrintHumanReadable() string {
 	buf := bytes.Buffer{}
-	for _, interestingMetric := range InterestingApiServerMetrics {
+	for _, interestingMetric := range interestingAPIServerMetrics {
 		buf.WriteString(fmt.Sprintf("For %v:\n", interestingMetric))
-		for _, sample := range (*m).ApiServerMetrics[interestingMetric] {
-			buf.WriteString(fmt.Sprintf("\t%v\n", metrics.PrintSample(sample)))
+		for _, sample := range (*m).APIServerMetrics[interestingMetric] {
+			buf.WriteString(fmt.Sprintf("\t%v\n", printSample(sample)))
 		}
 	}
-	for _, interestingMetric := range InterestingControllerManagerMetrics {
+	for _, interestingMetric := range interestingControllerManagerMetrics {
 		buf.WriteString(fmt.Sprintf("For %v:\n", interestingMetric))
 		for _, sample := range (*m).ControllerManagerMetrics[interestingMetric] {
-			buf.WriteString(fmt.Sprintf("\t%v\n", metrics.PrintSample(sample)))
+			buf.WriteString(fmt.Sprintf("\t%v\n", printSample(sample)))
+		}
+	}
+	for _, interestingMetric := range interestingClusterAutoscalerMetrics {
+		buf.WriteString(fmt.Sprintf("For %v:\n", interestingMetric))
+		for _, sample := range (*m).ClusterAutoscalerMetrics[interestingMetric] {
+			buf.WriteString(fmt.Sprintf("\t%v\n", printSample(sample)))
 		}
 	}
 	for kubelet, grabbed := range (*m).KubeletMetrics {
 		buf.WriteString(fmt.Sprintf("For %v:\n", kubelet))
-		for _, interestingMetric := range InterestingKubeletMetrics {
+		for _, interestingMetric := range interestingKubeletMetrics {
 			buf.WriteString(fmt.Sprintf("\tFor %v:\n", interestingMetric))
 			for _, sample := range grabbed[interestingMetric] {
-				buf.WriteString(fmt.Sprintf("\t\t%v\n", metrics.PrintSample(sample)))
+				buf.WriteString(fmt.Sprintf("\t\t%v\n", printSample(sample)))
 			}
 		}
 	}
 	return buf.String()
 }
 
+// PrintJSON returns e2e metrics with JSON format.
 func (m *MetricsForE2E) PrintJSON() string {
 	m.filterMetrics()
-	return PrettyPrintJSON(*m)
+	return PrettyPrintJSON(m)
 }
 
+// SummaryKind returns the summary of e2e metrics.
 func (m *MetricsForE2E) SummaryKind() string {
 	return "MetricsForE2E"
 }
 
-var InterestingApiServerMetrics = []string{
-	"apiserver_request_count",
+var schedulingLatencyMetricName = model.LabelValue(schedulermetric.SchedulerSubsystem + "_" + schedulermetric.SchedulingLatencyName)
+
+var interestingAPIServerMetrics = []string{
+	"apiserver_request_total",
+	// TODO(krzysied): apiserver_request_latencies_summary is a deprecated metric.
+	// It should be replaced with new metric.
 	"apiserver_request_latencies_summary",
-	"etcd_helper_cache_entry_count",
-	"etcd_helper_cache_hit_count",
-	"etcd_helper_cache_miss_count",
-	"etcd_request_cache_add_latencies_summary",
-	"etcd_request_cache_get_latencies_summary",
-	"etcd_request_latencies_summary",
+	"apiserver_init_events_total",
 }
 
-var InterestingControllerManagerMetrics = []string{
-	"garbage_collector_event_queue_latency",
-	"garbage_collector_dirty_queue_latency",
-	"garbage_collector_orhan_queue_latency",
+var interestingControllerManagerMetrics = []string{
+	"garbage_collector_attempt_to_delete_queue_latency",
+	"garbage_collector_attempt_to_delete_work_duration",
+	"garbage_collector_attempt_to_orphan_queue_latency",
+	"garbage_collector_attempt_to_orphan_work_duration",
+	"garbage_collector_dirty_processing_latency_microseconds",
+	"garbage_collector_event_processing_latency_microseconds",
+	"garbage_collector_graph_changes_queue_latency",
+	"garbage_collector_graph_changes_work_duration",
+	"garbage_collector_orphan_processing_latency_microseconds",
+
+	"namespace_queue_latency",
+	"namespace_queue_latency_sum",
+	"namespace_queue_latency_count",
+	"namespace_retries",
+	"namespace_work_duration",
+	"namespace_work_duration_sum",
+	"namespace_work_duration_count",
 }
 
-var InterestingKubeletMetrics = []string{
-	"kubelet_container_manager_latency_microseconds",
-	"kubelet_docker_errors",
-	"kubelet_docker_operations_latency_microseconds",
-	"kubelet_generate_pod_status_latency_microseconds",
-	"kubelet_pod_start_latency_microseconds",
-	"kubelet_pod_worker_latency_microseconds",
-	"kubelet_pod_worker_start_latency_microseconds",
-	"kubelet_sync_pods_latency_microseconds",
+var interestingKubeletMetrics = []string{
+	"kubelet_docker_operations_errors_total",
+	"kubelet_docker_operations_duration_seconds",
+	"kubelet_pod_start_duration_seconds",
+	"kubelet_pod_worker_duration_seconds",
+	"kubelet_pod_worker_start_duration_seconds",
 }
 
-// Dashboard metrics
+var interestingClusterAutoscalerMetrics = []string{
+	"function_duration_seconds",
+	"errors_total",
+	"evicted_pods_total",
+}
+
+// LatencyMetric is a struct for dashboard metrics.
 type LatencyMetric struct {
 	Perc50  time.Duration `json:"Perc50"`
 	Perc90  time.Duration `json:"Perc90"`
@@ -146,51 +207,253 @@ type LatencyMetric struct {
 	Perc100 time.Duration `json:"Perc100"`
 }
 
+// PodStartupLatency is a struct for managing latency of pod startup.
 type PodStartupLatency struct {
-	Latency LatencyMetric `json:"latency"`
+	CreateToScheduleLatency LatencyMetric `json:"createToScheduleLatency"`
+	ScheduleToRunLatency    LatencyMetric `json:"scheduleToRunLatency"`
+	RunToWatchLatency       LatencyMetric `json:"runToWatchLatency"`
+	ScheduleToWatchLatency  LatencyMetric `json:"scheduleToWatchLatency"`
+	E2ELatency              LatencyMetric `json:"e2eLatency"`
 }
 
-type SchedulingLatency struct {
-	Scheduling LatencyMetric `json:"scheduling"`
-	Binding    LatencyMetric `json:"binding"`
-	Total      LatencyMetric `json:"total"`
+// SummaryKind returns the summary of pod startup latency.
+func (l *PodStartupLatency) SummaryKind() string {
+	return "PodStartupLatency"
 }
 
-type SaturationTime struct {
-	TimeToSaturate time.Duration `json:"timeToStaturate"`
-	NumberOfNodes  int           `json:"numberOfNodes"`
-	NumberOfPods   int           `json:"numberOfPods"`
-	Throughput     float32       `json:"throughput"`
+// PrintHumanReadable returns pod startup letency with JSON format.
+func (l *PodStartupLatency) PrintHumanReadable() string {
+	return PrettyPrintJSON(l)
 }
 
+// PrintJSON returns pod startup letency with JSON format.
+func (l *PodStartupLatency) PrintJSON() string {
+	return PrettyPrintJSON(PodStartupLatencyToPerfData(l))
+}
+
+// SchedulingMetrics is a struct for managing scheduling metrics.
+type SchedulingMetrics struct {
+	PredicateEvaluationLatency  LatencyMetric `json:"predicateEvaluationLatency"`
+	PriorityEvaluationLatency   LatencyMetric `json:"priorityEvaluationLatency"`
+	PreemptionEvaluationLatency LatencyMetric `json:"preemptionEvaluationLatency"`
+	BindingLatency              LatencyMetric `json:"bindingLatency"`
+	ThroughputAverage           float64       `json:"throughputAverage"`
+	ThroughputPerc50            float64       `json:"throughputPerc50"`
+	ThroughputPerc90            float64       `json:"throughputPerc90"`
+	ThroughputPerc99            float64       `json:"throughputPerc99"`
+}
+
+// SummaryKind returns the summary of scheduling metrics.
+func (l *SchedulingMetrics) SummaryKind() string {
+	return "SchedulingMetrics"
+}
+
+// PrintHumanReadable returns scheduling metrics with JSON format.
+func (l *SchedulingMetrics) PrintHumanReadable() string {
+	return PrettyPrintJSON(l)
+}
+
+// PrintJSON returns scheduling metrics with JSON format.
+func (l *SchedulingMetrics) PrintJSON() string {
+	return PrettyPrintJSON(l)
+}
+
+// Histogram is a struct for managing histogram.
+type Histogram struct {
+	Labels  map[string]string `json:"labels"`
+	Buckets map[string]int    `json:"buckets"`
+}
+
+// HistogramVec is an array of Histogram.
+type HistogramVec []Histogram
+
+func newHistogram(labels map[string]string) *Histogram {
+	return &Histogram{
+		Labels:  labels,
+		Buckets: make(map[string]int),
+	}
+}
+
+// EtcdMetrics is a struct for managing etcd metrics.
+type EtcdMetrics struct {
+	BackendCommitDuration     HistogramVec `json:"backendCommitDuration"`
+	SnapshotSaveTotalDuration HistogramVec `json:"snapshotSaveTotalDuration"`
+	PeerRoundTripTime         HistogramVec `json:"peerRoundTripTime"`
+	WalFsyncDuration          HistogramVec `json:"walFsyncDuration"`
+	MaxDatabaseSize           float64      `json:"maxDatabaseSize"`
+}
+
+func newEtcdMetrics() *EtcdMetrics {
+	return &EtcdMetrics{
+		BackendCommitDuration:     make(HistogramVec, 0),
+		SnapshotSaveTotalDuration: make(HistogramVec, 0),
+		PeerRoundTripTime:         make(HistogramVec, 0),
+		WalFsyncDuration:          make(HistogramVec, 0),
+	}
+}
+
+// SummaryKind returns the summary of etcd metrics.
+func (l *EtcdMetrics) SummaryKind() string {
+	return "EtcdMetrics"
+}
+
+// PrintHumanReadable returns etcd metrics with JSON format.
+func (l *EtcdMetrics) PrintHumanReadable() string {
+	return PrettyPrintJSON(l)
+}
+
+// PrintJSON returns etcd metrics with JSON format.
+func (l *EtcdMetrics) PrintJSON() string {
+	return PrettyPrintJSON(l)
+}
+
+// EtcdMetricsCollector is a struct for managing etcd metrics collector.
+type EtcdMetricsCollector struct {
+	stopCh  chan struct{}
+	wg      *sync.WaitGroup
+	metrics *EtcdMetrics
+}
+
+// NewEtcdMetricsCollector creates a new etcd metrics collector.
+func NewEtcdMetricsCollector() *EtcdMetricsCollector {
+	return &EtcdMetricsCollector{
+		stopCh:  make(chan struct{}),
+		wg:      &sync.WaitGroup{},
+		metrics: newEtcdMetrics(),
+	}
+}
+
+func getEtcdMetrics() ([]*model.Sample, error) {
+	// Etcd is only exposed on localhost level. We are using ssh method
+	if TestContext.Provider == "gke" || TestContext.Provider == "eks" {
+		e2elog.Logf("Not grabbing etcd metrics through master SSH: unsupported for %s", TestContext.Provider)
+		return nil, nil
+	}
+
+	cmd := "curl http://localhost:2379/metrics"
+	sshResult, err := e2essh.SSH(cmd, GetMasterHost()+":22", TestContext.Provider)
+	if err != nil || sshResult.Code != 0 {
+		return nil, fmt.Errorf("unexpected error (code: %d) in ssh connection to master: %#v", sshResult.Code, err)
+	}
+	data := sshResult.Stdout
+
+	return extractMetricSamples(data)
+}
+
+func getEtcdDatabaseSize() (float64, error) {
+	samples, err := getEtcdMetrics()
+	if err != nil {
+		return 0, err
+	}
+	for _, sample := range samples {
+		if sample.Metric[model.MetricNameLabel] == "etcd_debugging_mvcc_db_total_size_in_bytes" {
+			return float64(sample.Value), nil
+		}
+	}
+	return 0, fmt.Errorf("Couldn't find etcd database size metric")
+}
+
+// StartCollecting starts to collect etcd db size metric periodically
+// and updates MaxDatabaseSize accordingly.
+func (mc *EtcdMetricsCollector) StartCollecting(interval time.Duration) {
+	mc.wg.Add(1)
+	go func() {
+		defer mc.wg.Done()
+		for {
+			select {
+			case <-time.After(interval):
+				dbSize, err := getEtcdDatabaseSize()
+				if err != nil {
+					e2elog.Logf("Failed to collect etcd database size")
+					continue
+				}
+				mc.metrics.MaxDatabaseSize = math.Max(mc.metrics.MaxDatabaseSize, dbSize)
+			case <-mc.stopCh:
+				return
+			}
+		}
+	}()
+}
+
+// StopAndSummarize stops etcd metrics collector and summarizes the metrics.
+func (mc *EtcdMetricsCollector) StopAndSummarize() error {
+	close(mc.stopCh)
+	mc.wg.Wait()
+
+	// Do some one-off collection of metrics.
+	samples, err := getEtcdMetrics()
+	if err != nil {
+		return err
+	}
+	for _, sample := range samples {
+		switch sample.Metric[model.MetricNameLabel] {
+		case "etcd_disk_backend_commit_duration_seconds_bucket":
+			convertSampleToBucket(sample, &mc.metrics.BackendCommitDuration)
+		case "etcd_debugging_snap_save_total_duration_seconds_bucket":
+			convertSampleToBucket(sample, &mc.metrics.SnapshotSaveTotalDuration)
+		case "etcd_disk_wal_fsync_duration_seconds_bucket":
+			convertSampleToBucket(sample, &mc.metrics.WalFsyncDuration)
+		case "etcd_network_peer_round_trip_time_seconds_bucket":
+			convertSampleToBucket(sample, &mc.metrics.PeerRoundTripTime)
+		}
+	}
+	return nil
+}
+
+// GetMetrics returns metrics of etcd metrics collector.
+func (mc *EtcdMetricsCollector) GetMetrics() *EtcdMetrics {
+	return mc.metrics
+}
+
+// APICall is a struct for managing API call.
 type APICall struct {
-	Resource string        `json:"resource"`
-	Verb     string        `json:"verb"`
-	Latency  LatencyMetric `json:"latency"`
-	Count    int           `json:"count"`
+	Resource    string        `json:"resource"`
+	Subresource string        `json:"subresource"`
+	Verb        string        `json:"verb"`
+	Scope       string        `json:"scope"`
+	Latency     LatencyMetric `json:"latency"`
+	Count       int           `json:"count"`
 }
 
+// APIResponsiveness is a struct for managing multiple API calls.
 type APIResponsiveness struct {
 	APICalls []APICall `json:"apicalls"`
 }
 
-func (a APIResponsiveness) Len() int      { return len(a.APICalls) }
-func (a APIResponsiveness) Swap(i, j int) { a.APICalls[i], a.APICalls[j] = a.APICalls[j], a.APICalls[i] }
-func (a APIResponsiveness) Less(i, j int) bool {
+// SummaryKind returns the summary of API responsiveness.
+func (a *APIResponsiveness) SummaryKind() string {
+	return "APIResponsiveness"
+}
+
+// PrintHumanReadable returns metrics with JSON format.
+func (a *APIResponsiveness) PrintHumanReadable() string {
+	return PrettyPrintJSON(a)
+}
+
+// PrintJSON returns metrics of PerfData(50, 90 and 99th percentiles) with JSON format.
+func (a *APIResponsiveness) PrintJSON() string {
+	return PrettyPrintJSON(APICallToPerfData(a))
+}
+
+func (a *APIResponsiveness) Len() int { return len(a.APICalls) }
+func (a *APIResponsiveness) Swap(i, j int) {
+	a.APICalls[i], a.APICalls[j] = a.APICalls[j], a.APICalls[i]
+}
+func (a *APIResponsiveness) Less(i, j int) bool {
 	return a.APICalls[i].Latency.Perc99 < a.APICalls[j].Latency.Perc99
 }
 
 // Set request latency for a particular quantile in the APICall metric entry (creating one if necessary).
 // 0 <= quantile <=1 (e.g. 0.95 is 95%tile, 0.5 is median)
 // Only 0.5, 0.9 and 0.99 quantiles are supported.
-func (a *APIResponsiveness) addMetricRequestLatency(resource, verb string, quantile float64, latency time.Duration) {
+func (a *APIResponsiveness) addMetricRequestLatency(resource, subresource, verb, scope string, quantile float64, latency time.Duration) {
 	for i, apicall := range a.APICalls {
-		if apicall.Resource == resource && apicall.Verb == verb {
+		if apicall.Resource == resource && apicall.Subresource == subresource && apicall.Verb == verb && apicall.Scope == scope {
 			a.APICalls[i] = setQuantileAPICall(apicall, quantile, latency)
 			return
 		}
 	}
-	apicall := setQuantileAPICall(APICall{Resource: resource, Verb: verb}, quantile, latency)
+	apicall := setQuantileAPICall(APICall{Resource: resource, Subresource: subresource, Verb: verb, Scope: scope}, quantile, latency)
 	a.APICalls = append(a.APICalls, apicall)
 }
 
@@ -214,28 +477,28 @@ func setQuantile(metric *LatencyMetric, quantile float64, latency time.Duration)
 }
 
 // Add request count to the APICall metric entry (creating one if necessary).
-func (a *APIResponsiveness) addMetricRequestCount(resource, verb string, count int) {
+func (a *APIResponsiveness) addMetricRequestCount(resource, subresource, verb, scope string, count int) {
 	for i, apicall := range a.APICalls {
-		if apicall.Resource == resource && apicall.Verb == verb {
+		if apicall.Resource == resource && apicall.Subresource == subresource && apicall.Verb == verb && apicall.Scope == scope {
 			a.APICalls[i].Count += count
 			return
 		}
 	}
-	apicall := APICall{Resource: resource, Verb: verb, Count: count}
+	apicall := APICall{Resource: resource, Subresource: subresource, Verb: verb, Count: count, Scope: scope}
 	a.APICalls = append(a.APICalls, apicall)
 }
 
-func readLatencyMetrics(c clientset.Interface) (APIResponsiveness, error) {
+func readLatencyMetrics(c clientset.Interface) (*APIResponsiveness, error) {
 	var a APIResponsiveness
 
 	body, err := getMetrics(c)
 	if err != nil {
-		return a, err
+		return nil, err
 	}
 
 	samples, err := extractMetricSamples(body)
 	if err != nil {
-		return a, err
+		return nil, err
 	}
 
 	ignoredResources := sets.NewString("events")
@@ -245,14 +508,16 @@ func readLatencyMetrics(c clientset.Interface) (APIResponsiveness, error) {
 	for _, sample := range samples {
 		// Example line:
 		// apiserver_request_latencies_summary{resource="namespaces",verb="LIST",quantile="0.99"} 908
-		// apiserver_request_count{resource="pods",verb="LIST",client="kubectl",code="200",contentType="json"} 233
+		// apiserver_request_total{resource="pods",verb="LIST",client="kubectl",code="200",contentType="json"} 233
 		if sample.Metric[model.MetricNameLabel] != "apiserver_request_latencies_summary" &&
-			sample.Metric[model.MetricNameLabel] != "apiserver_request_count" {
+			sample.Metric[model.MetricNameLabel] != "apiserver_request_total" {
 			continue
 		}
 
 		resource := string(sample.Metric["resource"])
+		subresource := string(sample.Metric["subresource"])
 		verb := string(sample.Metric["verb"])
+		scope := string(sample.Metric["scope"])
 		if ignoredResources.Has(resource) || ignoredVerbs.Has(verb) {
 			continue
 		}
@@ -262,34 +527,46 @@ func readLatencyMetrics(c clientset.Interface) (APIResponsiveness, error) {
 			latency := sample.Value
 			quantile, err := strconv.ParseFloat(string(sample.Metric[model.QuantileLabel]), 64)
 			if err != nil {
-				return a, err
+				return nil, err
 			}
-			a.addMetricRequestLatency(resource, verb, quantile, time.Duration(int64(latency))*time.Microsecond)
-		case "apiserver_request_count":
+			a.addMetricRequestLatency(resource, subresource, verb, scope, quantile, time.Duration(int64(latency))*time.Microsecond)
+		case "apiserver_request_total":
 			count := sample.Value
-			a.addMetricRequestCount(resource, verb, int(count))
+			a.addMetricRequestCount(resource, subresource, verb, scope, int(count))
 
 		}
 	}
 
-	return a, err
+	return &a, err
 }
 
-// Prints top five summary metrics for request types with latency and returns
-// number of such request types above threshold.
-func HighLatencyRequests(c clientset.Interface) (int, error) {
+// HighLatencyRequests prints top five summary metrics for request types with latency and returns
+// number of such request types above threshold. We use a higher threshold for
+// list calls if nodeCount is above a given threshold (i.e. cluster is big).
+func HighLatencyRequests(c clientset.Interface, nodeCount int) (int, *APIResponsiveness, error) {
+	isBigCluster := (nodeCount > bigClusterNodeCountThreshold)
 	metrics, err := readLatencyMetrics(c)
 	if err != nil {
-		return 0, err
+		return 0, metrics, err
 	}
 	sort.Sort(sort.Reverse(metrics))
 	badMetrics := 0
 	top := 5
-	for _, metric := range metrics.APICalls {
+	for i := range metrics.APICalls {
+		latency := metrics.APICalls[i].Latency.Perc99
+		isListCall := (metrics.APICalls[i].Verb == "LIST")
+		isClusterScopedCall := (metrics.APICalls[i].Scope == "cluster")
 		isBad := false
-		if metric.Latency.Perc99 > apiCallLatencyThreshold {
-			badMetrics++
+		latencyThreshold := apiCallLatencyThreshold
+		if isListCall && isBigCluster {
+			latencyThreshold = apiListCallLatencyThreshold
+			if isClusterScopedCall {
+				latencyThreshold = apiClusterScopeListCallThreshold
+			}
+		}
+		if latency > latencyThreshold {
 			isBad = true
+			badMetrics++
 		}
 		if top > 0 || isBad {
 			top--
@@ -297,39 +574,31 @@ func HighLatencyRequests(c clientset.Interface) (int, error) {
 			if isBad {
 				prefix = "WARNING "
 			}
-			Logf("%vTop latency metric: %+v", prefix, metric)
+			e2elog.Logf("%vTop latency metric: %+v", prefix, metrics.APICalls[i])
 		}
 	}
-
-	// TODO(random-liu): Remove the log when we migrate to new perfdash
-	Logf("API calls latencies: %s", PrettyPrintJSON(metrics))
-	// Log perf data
-	PrintPerfData(ApiCallToPerfData(metrics))
-
-	return badMetrics, nil
+	return badMetrics, metrics, nil
 }
 
-// Verifies whether 50, 90 and 99th percentiles of PodStartupLatency are
-// within the threshold.
-func VerifyPodStartupLatency(latency PodStartupLatency) error {
-	Logf("Pod startup latency: %s", PrettyPrintJSON(latency))
-
-	if latency.Latency.Perc50 > podStartupThreshold {
-		return fmt.Errorf("too high pod startup latency 50th percentile: %v", latency.Latency.Perc50)
+// VerifyLatencyWithinThreshold verifies whether 50, 90 and 99th percentiles of a latency metric are
+// within the expected threshold.
+func VerifyLatencyWithinThreshold(threshold, actual LatencyMetric, metricName string) error {
+	if actual.Perc50 > threshold.Perc50 {
+		return fmt.Errorf("too high %v latency 50th percentile: %v", metricName, actual.Perc50)
 	}
-	if latency.Latency.Perc90 > podStartupThreshold {
-		return fmt.Errorf("too high pod startup latency 90th percentile: %v", latency.Latency.Perc90)
+	if actual.Perc90 > threshold.Perc90 {
+		return fmt.Errorf("too high %v latency 90th percentile: %v", metricName, actual.Perc90)
 	}
-	if latency.Latency.Perc99 > podStartupThreshold {
-		return fmt.Errorf("too high pod startup latency 99th percentil: %v", latency.Latency.Perc99)
+	if actual.Perc99 > threshold.Perc99 {
+		return fmt.Errorf("too high %v latency 99th percentile: %v", metricName, actual.Perc99)
 	}
 	return nil
 }
 
-// Resets latency metrics in apiserver.
+// ResetMetrics resets latency metrics in apiserver.
 func ResetMetrics(c clientset.Interface) error {
-	Logf("Resetting latency metrics in apiserver...")
-	body, err := c.Core().RESTClient().Delete().AbsPath("/metrics").DoRaw()
+	e2elog.Logf("Resetting latency metrics in apiserver...")
+	body, err := c.CoreV1().RESTClient().Delete().AbsPath("/metrics").DoRaw()
 	if err != nil {
 		return err
 	}
@@ -341,119 +610,154 @@ func ResetMetrics(c clientset.Interface) error {
 
 // Retrieves metrics information.
 func getMetrics(c clientset.Interface) (string, error) {
-	body, err := c.Core().RESTClient().Get().AbsPath("/metrics").DoRaw()
+	body, err := c.CoreV1().RESTClient().Get().AbsPath("/metrics").DoRaw()
 	if err != nil {
 		return "", err
 	}
 	return string(body), nil
 }
 
-// Retrieves scheduler metrics information.
-func getSchedulingLatency(c clientset.Interface) (SchedulingLatency, error) {
-	result := SchedulingLatency{}
-
-	// Check if master Node is registered
-	nodes, err := c.Core().Nodes().List(metav1.ListOptions{})
-	ExpectNoError(err)
-
-	subResourceProxyAvailable, err := ServerVersionGTE(SubResourcePodProxyVersion, c.Discovery())
-	if err != nil {
-		return result, err
+// Sends REST request to kube scheduler metrics
+func sendRestRequestToScheduler(c clientset.Interface, op string) (string, error) {
+	opUpper := strings.ToUpper(op)
+	if opUpper != "GET" && opUpper != "DELETE" {
+		return "", fmt.Errorf("Unknown REST request")
 	}
 
-	var data string
+	nodes, err := c.CoreV1().Nodes().List(metav1.ListOptions{})
+	ExpectNoError(err)
+
 	var masterRegistered = false
 	for _, node := range nodes.Items {
 		if system.IsMasterNode(node.Name) {
 			masterRegistered = true
 		}
 	}
+
+	var responseText string
 	if masterRegistered {
 		ctx, cancel := context.WithTimeout(context.Background(), SingleCallTimeout)
 		defer cancel()
 
-		var rawData []byte
-		if subResourceProxyAvailable {
-			rawData, err = c.Core().RESTClient().Get().
-				Context(ctx).
-				Namespace(metav1.NamespaceSystem).
-				Resource("pods").
-				Name(fmt.Sprintf("kube-scheduler-%v:%v", TestContext.CloudConfig.MasterName, ports.SchedulerPort)).
-				SubResource("proxy").
-				Suffix("metrics").
-				Do().Raw()
-		} else {
-			rawData, err = c.Core().RESTClient().Get().
-				Context(ctx).
-				Prefix("proxy").
-				Namespace(metav1.NamespaceSystem).
-				SubResource("pods").
-				Name(fmt.Sprintf("kube-scheduler-%v:%v", TestContext.CloudConfig.MasterName, ports.SchedulerPort)).
-				Suffix("metrics").
-				Do().Raw()
-		}
+		body, err := c.CoreV1().RESTClient().Verb(opUpper).
+			Context(ctx).
+			Namespace(metav1.NamespaceSystem).
+			Resource("pods").
+			Name(fmt.Sprintf("kube-scheduler-%v:%v", TestContext.CloudConfig.MasterName, ports.InsecureSchedulerPort)).
+			SubResource("proxy").
+			Suffix("metrics").
+			Do().Raw()
 
 		ExpectNoError(err)
-		data = string(rawData)
+		responseText = string(body)
 	} else {
 		// If master is not registered fall back to old method of using SSH.
-		cmd := "curl http://localhost:10251/metrics"
-		sshResult, err := SSH(cmd, GetMasterHost()+":22", TestContext.Provider)
-		if err != nil || sshResult.Code != 0 {
-			return result, fmt.Errorf("unexpected error (code: %d) in ssh connection to master: %#v", sshResult.Code, err)
+		if TestContext.Provider == "gke" || TestContext.Provider == "eks" {
+			e2elog.Logf("Not grabbing scheduler metrics through master SSH: unsupported for %s", TestContext.Provider)
+			return "", nil
 		}
-		data = sshResult.Stdout
+
+		cmd := "curl -X " + opUpper + " http://localhost:10251/metrics"
+		sshResult, err := e2essh.SSH(cmd, GetMasterHost()+":22", TestContext.Provider)
+		if err != nil || sshResult.Code != 0 {
+			return "", fmt.Errorf("unexpected error (code: %d) in ssh connection to master: %#v", sshResult.Code, err)
+		}
+		responseText = sshResult.Stdout
 	}
+	return responseText, nil
+}
+
+// Retrieves scheduler latency metrics.
+func getSchedulingLatency(c clientset.Interface) (*SchedulingMetrics, error) {
+	result := SchedulingMetrics{}
+	data, err := sendRestRequestToScheduler(c, "GET")
+	if err != nil {
+		return nil, err
+	}
+
 	samples, err := extractMetricSamples(data)
 	if err != nil {
-		return result, err
+		return nil, err
 	}
 
 	for _, sample := range samples {
-		var metric *LatencyMetric = nil
-		switch sample.Metric[model.MetricNameLabel] {
-		case "scheduler_scheduling_algorithm_latency_microseconds":
-			metric = &result.Scheduling
-		case "scheduler_binding_latency_microseconds":
-			metric = &result.Binding
-		case "scheduler_e2e_scheduling_latency_microseconds":
-			metric = &result.Total
+		if sample.Metric[model.MetricNameLabel] != schedulingLatencyMetricName {
+			continue
+		}
+
+		var metric *LatencyMetric
+		switch sample.Metric[schedulermetric.OperationLabel] {
+		case schedulermetric.PredicateEvaluation:
+			metric = &result.PredicateEvaluationLatency
+		case schedulermetric.PriorityEvaluation:
+			metric = &result.PriorityEvaluationLatency
+		case schedulermetric.PreemptionEvaluation:
+			metric = &result.PreemptionEvaluationLatency
+		case schedulermetric.Binding:
+			metric = &result.BindingLatency
 		}
 		if metric == nil {
 			continue
 		}
 
-		latency := sample.Value
 		quantile, err := strconv.ParseFloat(string(sample.Metric[model.QuantileLabel]), 64)
 		if err != nil {
-			return result, err
+			return nil, err
 		}
-		setQuantile(metric, quantile, time.Duration(int64(latency))*time.Microsecond)
+		setQuantile(metric, quantile, time.Duration(int64(float64(sample.Value)*float64(time.Second))))
 	}
-	return result, nil
+	return &result, nil
 }
 
-// Verifies (currently just by logging them) the scheduling latencies.
-func VerifySchedulerLatency(c clientset.Interface) error {
+// VerifySchedulerLatency verifies (currently just by logging them) the scheduling latencies.
+func VerifySchedulerLatency(c clientset.Interface) (*SchedulingMetrics, error) {
 	latency, err := getSchedulingLatency(c)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	Logf("Scheduling latency: %s", PrettyPrintJSON(latency))
+	return latency, nil
+}
 
-	// TODO: Add some reasonable checks once we know more about the values.
+// ResetSchedulerMetrics sends a DELETE request to kube-scheduler for resetting metrics.
+func ResetSchedulerMetrics(c clientset.Interface) error {
+	responseText, err := sendRestRequestToScheduler(c, "DELETE")
+	if err != nil {
+		return fmt.Errorf("Unexpected response: %q", responseText)
+	}
 	return nil
 }
 
+func convertSampleToBucket(sample *model.Sample, h *HistogramVec) {
+	labels := make(map[string]string)
+	for k, v := range sample.Metric {
+		if k != "le" {
+			labels[string(k)] = string(v)
+		}
+	}
+	var hist *Histogram
+	for i := range *h {
+		if reflect.DeepEqual(labels, (*h)[i].Labels) {
+			hist = &((*h)[i])
+			break
+		}
+	}
+	if hist == nil {
+		hist = newHistogram(labels)
+		*h = append(*h, *hist)
+	}
+	hist.Buckets[string(sample.Metric["le"])] = int(sample.Value)
+}
+
+// PrettyPrintJSON converts metrics to JSON format.
 func PrettyPrintJSON(metrics interface{}) string {
 	output := &bytes.Buffer{}
 	if err := json.NewEncoder(output).Encode(metrics); err != nil {
-		Logf("Error building encoder: %v", err)
+		e2elog.Logf("Error building encoder: %v", err)
 		return ""
 	}
 	formatted := &bytes.Buffer{}
 	if err := json.Indent(formatted, output.Bytes(), "", "  "); err != nil {
-		Logf("Error indenting: %v", err)
+		e2elog.Logf("Error indenting: %v", err)
 		return ""
 	}
 	return string(formatted.Bytes())
@@ -491,12 +795,14 @@ type PodLatencyData struct {
 	Latency time.Duration
 }
 
+// LatencySlice is an array of PodLatencyData which encapsulates pod startup latency information.
 type LatencySlice []PodLatencyData
 
 func (a LatencySlice) Len() int           { return len(a) }
 func (a LatencySlice) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a LatencySlice) Less(i, j int) bool { return a[i].Latency < a[j].Latency }
 
+// ExtractLatencyMetrics returns latency metrics for each percentile(50th, 90th and 99th).
 func ExtractLatencyMetrics(latencies []PodLatencyData) LatencyMetric {
 	length := len(latencies)
 	perc50 := latencies[int(math.Ceil(float64(length*50)/100))-1].Latency
@@ -514,15 +820,37 @@ func LogSuspiciousLatency(latencyData []PodLatencyData, latencyDataLag []PodLate
 	}
 	for _, l := range latencyData {
 		if l.Latency > NodeStartupThreshold {
-			HighLatencyKubeletOperations(c, 1*time.Second, l.Node, Logf)
+			HighLatencyKubeletOperations(c, 1*time.Second, l.Node, e2elog.Logf)
 		}
 	}
-	Logf("Approx throughput: %v pods/min",
+	e2elog.Logf("Approx throughput: %v pods/min",
 		float64(nodeCount)/(latencyDataLag[len(latencyDataLag)-1].Latency.Minutes()))
 }
 
+// PrintLatencies outputs latencies to log with readable format.
 func PrintLatencies(latencies []PodLatencyData, header string) {
 	metrics := ExtractLatencyMetrics(latencies)
-	Logf("10%% %s: %v", header, latencies[(len(latencies)*9)/10:])
-	Logf("perc50: %v, perc90: %v, perc99: %v", metrics.Perc50, metrics.Perc90, metrics.Perc99)
+	e2elog.Logf("10%% %s: %v", header, latencies[(len(latencies)*9)/10:])
+	e2elog.Logf("perc50: %v, perc90: %v, perc99: %v", metrics.Perc50, metrics.Perc90, metrics.Perc99)
+}
+
+func (m *MetricsForE2E) computeClusterAutoscalerMetricsDelta(before metrics.Collection) {
+	if beforeSamples, found := before.ClusterAutoscalerMetrics[caFunctionMetric]; found {
+		if afterSamples, found := m.ClusterAutoscalerMetrics[caFunctionMetric]; found {
+			beforeSamplesMap := make(map[string]*model.Sample)
+			for _, bSample := range beforeSamples {
+				beforeSamplesMap[makeKey(bSample.Metric[caFunctionMetricLabel], bSample.Metric["le"])] = bSample
+			}
+			for _, aSample := range afterSamples {
+				if bSample, found := beforeSamplesMap[makeKey(aSample.Metric[caFunctionMetricLabel], aSample.Metric["le"])]; found {
+					aSample.Value = aSample.Value - bSample.Value
+				}
+
+			}
+		}
+	}
+}
+
+func makeKey(a, b model.LabelValue) string {
+	return string(a) + "___" + string(b)
 }

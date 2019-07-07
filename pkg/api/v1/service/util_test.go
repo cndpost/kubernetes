@@ -17,18 +17,17 @@ limitations under the License.
 package service
 
 import (
+	"strings"
 	"testing"
 
-	"strings"
-
-	"k8s.io/kubernetes/pkg/api/v1"
-	netsets "k8s.io/kubernetes/pkg/util/net/sets"
+	"k8s.io/api/core/v1"
+	utilnet "k8s.io/utils/net"
 )
 
 func TestGetLoadBalancerSourceRanges(t *testing.T) {
 	checkError := func(v string) {
 		annotations := make(map[string]string)
-		annotations[AnnotationLoadBalancerSourceRangesKey] = v
+		annotations[v1.AnnotationLoadBalancerSourceRangesKey] = v
 		svc := v1.Service{}
 		svc.Annotations = annotations
 		_, err := GetLoadBalancerSourceRanges(&svc)
@@ -49,18 +48,18 @@ func TestGetLoadBalancerSourceRanges(t *testing.T) {
 	checkError("10.0.0.1/32, ")
 	checkError("10.0.0.1")
 
-	checkOK := func(v string) netsets.IPNet {
+	checkOK := func(v string) utilnet.IPNetSet {
 		annotations := make(map[string]string)
-		annotations[AnnotationLoadBalancerSourceRangesKey] = v
+		annotations[v1.AnnotationLoadBalancerSourceRangesKey] = v
 		svc := v1.Service{}
 		svc.Annotations = annotations
-		cidrs, err := GetLoadBalancerSourceRanges(&svc)
+		_, err := GetLoadBalancerSourceRanges(&svc)
 		if err != nil {
 			t.Errorf("Unexpected error parsing: %q", v)
 		}
 		svc = v1.Service{}
 		svc.Spec.LoadBalancerSourceRanges = strings.Split(v, ",")
-		cidrs, err = GetLoadBalancerSourceRanges(&svc)
+		cidrs, err := GetLoadBalancerSourceRanges(&svc)
 		if err != nil {
 			t.Errorf("Unexpected error parsing: %q", v)
 		}
@@ -96,7 +95,7 @@ func TestGetLoadBalancerSourceRanges(t *testing.T) {
 	}
 	// check SourceRanges annotation is empty
 	annotations := make(map[string]string)
-	annotations[AnnotationLoadBalancerSourceRangesKey] = ""
+	annotations[v1.AnnotationLoadBalancerSourceRangesKey] = ""
 	svc = v1.Service{}
 	svc.Annotations = annotations
 	cidrs, err = GetLoadBalancerSourceRanges(&svc)
@@ -113,7 +112,7 @@ func TestGetLoadBalancerSourceRanges(t *testing.T) {
 
 func TestAllowAll(t *testing.T) {
 	checkAllowAll := func(allowAll bool, cidrs ...string) {
-		ipnets, err := netsets.ParseIPNets(cidrs...)
+		ipnets, err := utilnet.ParseIPNets(cidrs...)
 		if err != nil {
 			t.Errorf("Unexpected error parsing cidrs: %v", cidrs)
 		}
@@ -128,4 +127,90 @@ func TestAllowAll(t *testing.T) {
 	checkAllowAll(true, "0.0.0.0/0")
 	checkAllowAll(true, "192.168.0.0/0")
 	checkAllowAll(true, "192.168.0.1/32", "0.0.0.0/0")
+}
+
+func TestRequestsOnlyLocalTraffic(t *testing.T) {
+	checkRequestsOnlyLocalTraffic := func(requestsOnlyLocalTraffic bool, service *v1.Service) {
+		res := RequestsOnlyLocalTraffic(service)
+		if res != requestsOnlyLocalTraffic {
+			t.Errorf("Expected requests OnlyLocal traffic = %v, got %v",
+				requestsOnlyLocalTraffic, res)
+		}
+	}
+
+	checkRequestsOnlyLocalTraffic(false, &v1.Service{})
+	checkRequestsOnlyLocalTraffic(false, &v1.Service{
+		Spec: v1.ServiceSpec{
+			Type: v1.ServiceTypeClusterIP,
+		},
+	})
+	checkRequestsOnlyLocalTraffic(false, &v1.Service{
+		Spec: v1.ServiceSpec{
+			Type: v1.ServiceTypeNodePort,
+		},
+	})
+	checkRequestsOnlyLocalTraffic(false, &v1.Service{
+		Spec: v1.ServiceSpec{
+			Type:                  v1.ServiceTypeNodePort,
+			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeCluster,
+		},
+	})
+	checkRequestsOnlyLocalTraffic(true, &v1.Service{
+		Spec: v1.ServiceSpec{
+			Type:                  v1.ServiceTypeNodePort,
+			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
+		},
+	})
+	checkRequestsOnlyLocalTraffic(false, &v1.Service{
+		Spec: v1.ServiceSpec{
+			Type:                  v1.ServiceTypeLoadBalancer,
+			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeCluster,
+		},
+	})
+	checkRequestsOnlyLocalTraffic(true, &v1.Service{
+		Spec: v1.ServiceSpec{
+			Type:                  v1.ServiceTypeLoadBalancer,
+			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
+		},
+	})
+}
+
+func TestNeedsHealthCheck(t *testing.T) {
+	checkNeedsHealthCheck := func(needsHealthCheck bool, service *v1.Service) {
+		res := NeedsHealthCheck(service)
+		if res != needsHealthCheck {
+			t.Errorf("Expected needs health check = %v, got %v",
+				needsHealthCheck, res)
+		}
+	}
+
+	checkNeedsHealthCheck(false, &v1.Service{
+		Spec: v1.ServiceSpec{
+			Type: v1.ServiceTypeClusterIP,
+		},
+	})
+	checkNeedsHealthCheck(false, &v1.Service{
+		Spec: v1.ServiceSpec{
+			Type:                  v1.ServiceTypeNodePort,
+			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeCluster,
+		},
+	})
+	checkNeedsHealthCheck(false, &v1.Service{
+		Spec: v1.ServiceSpec{
+			Type:                  v1.ServiceTypeNodePort,
+			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
+		},
+	})
+	checkNeedsHealthCheck(false, &v1.Service{
+		Spec: v1.ServiceSpec{
+			Type:                  v1.ServiceTypeLoadBalancer,
+			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeCluster,
+		},
+	})
+	checkNeedsHealthCheck(true, &v1.Service{
+		Spec: v1.ServiceSpec{
+			Type:                  v1.ServiceTypeLoadBalancer,
+			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
+		},
+	})
 }

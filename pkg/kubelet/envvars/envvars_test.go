@@ -20,8 +20,8 @@ import (
 	"reflect"
 	"testing"
 
+	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/kubernetes/pkg/api/v1"
 	"k8s.io/kubernetes/pkg/kubelet/envvars"
 )
 
@@ -79,6 +79,27 @@ func TestFromServices(t *testing.T) {
 				},
 			},
 		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "super-ipv6"},
+			Spec: v1.ServiceSpec{
+				Selector:  map[string]string{"bar": "baz"},
+				ClusterIP: "2001:DB8::",
+				Ports: []v1.ServicePort{
+					{Name: "u-d-p", Port: 8084, Protocol: "UDP"},
+					{Name: "t-c-p", Port: 8084, Protocol: "TCP"},
+				},
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "sctp-1"},
+			Spec: v1.ServiceSpec{
+				Selector:  map[string]string{"bar": "sctp-sel"},
+				ClusterIP: "1.2.3.4",
+				Ports: []v1.ServicePort{
+					{Port: 777, Protocol: "SCTP"},
+				},
+			},
+		},
 	}
 	vars := envvars.FromServices(sl)
 	expected := []v1.EnvVar{
@@ -114,6 +135,26 @@ func TestFromServices(t *testing.T) {
 		{Name: "Q_U_U_X_PORT_8083_TCP_PROTO", Value: "tcp"},
 		{Name: "Q_U_U_X_PORT_8083_TCP_PORT", Value: "8083"},
 		{Name: "Q_U_U_X_PORT_8083_TCP_ADDR", Value: "9.8.7.6"},
+		{Name: "SUPER_IPV6_SERVICE_HOST", Value: "2001:DB8::"},
+		{Name: "SUPER_IPV6_SERVICE_PORT", Value: "8084"},
+		{Name: "SUPER_IPV6_SERVICE_PORT_U_D_P", Value: "8084"},
+		{Name: "SUPER_IPV6_SERVICE_PORT_T_C_P", Value: "8084"},
+		{Name: "SUPER_IPV6_PORT", Value: "udp://[2001:DB8::]:8084"},
+		{Name: "SUPER_IPV6_PORT_8084_UDP", Value: "udp://[2001:DB8::]:8084"},
+		{Name: "SUPER_IPV6_PORT_8084_UDP_PROTO", Value: "udp"},
+		{Name: "SUPER_IPV6_PORT_8084_UDP_PORT", Value: "8084"},
+		{Name: "SUPER_IPV6_PORT_8084_UDP_ADDR", Value: "2001:DB8::"},
+		{Name: "SUPER_IPV6_PORT_8084_TCP", Value: "tcp://[2001:DB8::]:8084"},
+		{Name: "SUPER_IPV6_PORT_8084_TCP_PROTO", Value: "tcp"},
+		{Name: "SUPER_IPV6_PORT_8084_TCP_PORT", Value: "8084"},
+		{Name: "SUPER_IPV6_PORT_8084_TCP_ADDR", Value: "2001:DB8::"},
+		{Name: "SCTP_1_SERVICE_HOST", Value: "1.2.3.4"},
+		{Name: "SCTP_1_SERVICE_PORT", Value: "777"},
+		{Name: "SCTP_1_PORT", Value: "sctp://1.2.3.4:777"},
+		{Name: "SCTP_1_PORT_777_SCTP", Value: "sctp://1.2.3.4:777"},
+		{Name: "SCTP_1_PORT_777_SCTP_PROTO", Value: "sctp"},
+		{Name: "SCTP_1_PORT_777_SCTP_PORT", Value: "777"},
+		{Name: "SCTP_1_PORT_777_SCTP_ADDR", Value: "1.2.3.4"},
 	}
 	if len(vars) != len(expected) {
 		t.Errorf("Expected %d env vars, got: %+v", len(expected), vars)

@@ -17,284 +17,425 @@ limitations under the License.
 package certs
 
 import (
-	"crypto/rsa"
+	"crypto"
 	"crypto/x509"
 	"fmt"
-	"net"
 	"os"
+	"path/filepath"
 
-	setutil "k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/apimachinery/pkg/util/validation"
+	"github.com/pkg/errors"
 	certutil "k8s.io/client-go/util/cert"
+	"k8s.io/client-go/util/keyutil"
+	"k8s.io/klog"
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
+	pkiutil "k8s.io/kubernetes/cmd/kubeadm/app/util/pkiutil"
+
 	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
-	"k8s.io/kubernetes/cmd/kubeadm/app/phases/certs/pkiutil"
-	"k8s.io/kubernetes/pkg/registry/core/service/ipallocator"
 )
 
-// TODO: Integration test cases
-// no files exist => create all four files
-// valid ca.{crt,key} exists => create apiserver.{crt,key}
-// valid ca.{crt,key} and apiserver.{crt,key} exists => do nothing
-// invalid ca.{crt,key} exists => error
-// only one of the .crt or .key file exists => error
-
 // CreatePKIAssets will create and write to disk all PKI assets necessary to establish the control plane.
-// It generates a self-signed CA certificate and a server certificate (signed by the CA)
-func CreatePKIAssets(cfg *kubeadmapi.MasterConfiguration) error {
-	pkiDir := cfg.CertificatesDir
-	hostname, err := os.Hostname()
-	if err != nil {
-		return fmt.Errorf("couldn't get the hostname: %v", err)
+// If the PKI assets already exists in the target folder, they are used only if evaluated equal; otherwise an error is returned.
+func CreatePKIAssets(cfg *kubeadmapi.InitConfiguration) error {
+	klog.V(1).Infoln("creating PKI assets")
+
+	// This structure cannot handle multilevel CA hierarchies.
+	// This isn't a problem right now, but may become one in the future.
+
+	var certList Certificates
+
+	if cfg.Etcd.Local == nil {
+		certList = GetCertsWithoutEtcd()
+	} else {
+		certList = GetDefaultCertList()
 	}
 
-	_, svcSubnet, err := net.ParseCIDR(cfg.Networking.ServiceSubnet)
+	certTree, err := certList.AsMap().CertTree()
 	if err != nil {
-		return fmt.Errorf("error parsing CIDR %q: %v", cfg.Networking.ServiceSubnet, err)
+		return err
 	}
 
-	// Build the list of SANs
-	altNames := getAltNames(cfg.APIServerCertSANs, hostname, cfg.Networking.DNSDomain, svcSubnet)
-	// Append the address the API Server is advertising
-	altNames.IPs = append(altNames.IPs, net.ParseIP(cfg.API.AdvertiseAddress))
+	if err := certTree.CreateTree(cfg); err != nil {
+		return errors.Wrap(err, "error creating PKI assets")
+	}
 
-	var caCert *x509.Certificate
-	var caKey *rsa.PrivateKey
-	// If at least one of them exists, we should try to load them
-	// In the case that only one exists, there will most likely be an error anyway
-	if pkiutil.CertOrKeyExist(pkiDir, kubeadmconstants.CACertAndKeyBaseName) {
-		// Try to load ca.crt and ca.key from the PKI directory
-		caCert, caKey, err = pkiutil.TryLoadCertAndKeyFromDisk(pkiDir, kubeadmconstants.CACertAndKeyBaseName)
-		if err != nil || caCert == nil || caKey == nil {
-			return fmt.Errorf("certificate and/or key existed but they could not be loaded properly")
+	fmt.Printf("[certs] Valid certificates and keys now exist in %q\n", cfg.CertificatesDir)
+
+	// Service accounts are not x509 certs, so handled separately
+	return CreateServiceAccountKeyAndPublicKeyFiles(cfg.CertificatesDir)
+}
+
+// CreateServiceAccountKeyAndPublicKeyFiles create a new public/private key files for signing service account users.
+// If the sa public/private key files already exists in the target folder, they are used only if evaluated equals; otherwise an error is returned.
+func CreateServiceAccountKeyAndPublicKeyFiles(certsDir string) error {
+	klog.V(1).Infoln("creating a new public/private key files for signing service account users")
+	_, err := keyutil.PrivateKeyFromFile(filepath.Join(certsDir, kubeadmconstants.ServiceAccountPrivateKeyName))
+	if err == nil {
+		// kubeadm doesn't validate the existing certificate key more than this;
+		// Basically, if we find a key file with the same path kubeadm thinks those files
+		// are equal and doesn't bother writing a new file
+		fmt.Printf("[certs] Using the existing %q key\n", kubeadmconstants.ServiceAccountKeyBaseName)
+		return nil
+	} else if !os.IsNotExist(err) {
+		return errors.Wrapf(err, "file %s existed but it could not be loaded properly", kubeadmconstants.ServiceAccountPrivateKeyName)
+	}
+
+	// The key does NOT exist, let's generate it now
+	key, err := pkiutil.NewPrivateKey()
+	if err != nil {
+		return err
+	}
+
+	// Write .key and .pub files to disk
+	fmt.Printf("[certs] Generating %q key and public key\n", kubeadmconstants.ServiceAccountKeyBaseName)
+
+	if err := pkiutil.WriteKey(certsDir, kubeadmconstants.ServiceAccountKeyBaseName, key); err != nil {
+		return err
+	}
+
+	return pkiutil.WritePublicKey(certsDir, kubeadmconstants.ServiceAccountKeyBaseName, key.Public())
+}
+
+// CreateCACertAndKeyFiles generates and writes out a given certificate authority.
+// The certSpec should be one of the variables from this package.
+func CreateCACertAndKeyFiles(certSpec *KubeadmCert, cfg *kubeadmapi.InitConfiguration) error {
+	if certSpec.CAName != "" {
+		return errors.Errorf("this function should only be used for CAs, but cert %s has CA %s", certSpec.Name, certSpec.CAName)
+	}
+	klog.V(1).Infof("creating a new certificate authority for %s", certSpec.Name)
+
+	certConfig, err := certSpec.GetConfig(cfg)
+	if err != nil {
+		return err
+	}
+
+	caCert, caKey, err := pkiutil.NewCertificateAuthority(certConfig)
+	if err != nil {
+		return err
+	}
+
+	return writeCertificateAuthorithyFilesIfNotExist(
+		cfg.CertificatesDir,
+		certSpec.BaseName,
+		caCert,
+		caKey,
+	)
+}
+
+// NewCSR will generate a new CSR and accompanying key
+func NewCSR(certSpec *KubeadmCert, cfg *kubeadmapi.InitConfiguration) (*x509.CertificateRequest, crypto.Signer, error) {
+	certConfig, err := certSpec.GetConfig(cfg)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "failed to retrieve cert configuration")
+	}
+
+	return pkiutil.NewCSRAndKey(certConfig)
+}
+
+// CreateCSR creates a certificate signing request
+func CreateCSR(certSpec *KubeadmCert, cfg *kubeadmapi.InitConfiguration, path string) error {
+	csr, key, err := NewCSR(certSpec, cfg)
+	if err != nil {
+		return err
+	}
+	return writeCSRFilesIfNotExist(path, certSpec.BaseName, csr, key)
+}
+
+// CreateCertAndKeyFilesWithCA loads the given certificate authority from disk, then generates and writes out the given certificate and key.
+// The certSpec and caCertSpec should both be one of the variables from this package.
+func CreateCertAndKeyFilesWithCA(certSpec *KubeadmCert, caCertSpec *KubeadmCert, cfg *kubeadmapi.InitConfiguration) error {
+	if certSpec.CAName != caCertSpec.Name {
+		return errors.Errorf("expected CAname for %s to be %q, but was %s", certSpec.Name, certSpec.CAName, caCertSpec.Name)
+	}
+
+	caCert, caKey, err := LoadCertificateAuthority(cfg.CertificatesDir, caCertSpec.BaseName)
+	if err != nil {
+		return errors.Wrapf(err, "couldn't load CA certificate %s", caCertSpec.Name)
+	}
+
+	return certSpec.CreateFromCA(cfg, caCert, caKey)
+}
+
+// LoadCertificateAuthority tries to load a CA in the given directory with the given name.
+func LoadCertificateAuthority(pkiDir string, baseName string) (*x509.Certificate, crypto.Signer, error) {
+	// Checks if certificate authority exists in the PKI directory
+	if !pkiutil.CertOrKeyExist(pkiDir, baseName) {
+		return nil, nil, errors.Errorf("couldn't load %s certificate authority from %s", baseName, pkiDir)
+	}
+
+	// Try to load certificate authority .crt and .key from the PKI directory
+	caCert, caKey, err := pkiutil.TryLoadCertAndKeyFromDisk(pkiDir, baseName)
+	if err != nil {
+		return nil, nil, errors.Wrapf(err, "failure loading %s certificate authority", baseName)
+	}
+
+	// Make sure the loaded CA cert actually is a CA
+	if !caCert.IsCA {
+		return nil, nil, errors.Errorf("%s certificate is not a certificate authority", baseName)
+	}
+
+	return caCert, caKey, nil
+}
+
+// writeCertificateAuthorithyFilesIfNotExist write a new certificate Authority to the given path.
+// If there already is a certificate file at the given path; kubeadm tries to load it and check if the values in the
+// existing and the expected certificate equals. If they do; kubeadm will just skip writing the file as it's up-to-date,
+// otherwise this function returns an error.
+func writeCertificateAuthorithyFilesIfNotExist(pkiDir string, baseName string, caCert *x509.Certificate, caKey crypto.Signer) error {
+
+	// If cert or key exists, we should try to load them
+	if pkiutil.CertOrKeyExist(pkiDir, baseName) {
+
+		// Try to load .crt and .key from the PKI directory
+		caCert, _, err := pkiutil.TryLoadCertAndKeyFromDisk(pkiDir, baseName)
+		if err != nil {
+			return errors.Wrapf(err, "failure loading %s certificate", baseName)
 		}
 
-		// The certificate and key could be loaded, but the certificate is not a CA
+		// Check if the existing cert is a CA
 		if !caCert.IsCA {
-			return fmt.Errorf("certificate and key could be loaded but the certificate is not a CA")
+			return errors.Errorf("certificate %s is not a CA", baseName)
 		}
 
-		fmt.Println("[certificates] Using the existing CA certificate and key.")
+		// kubeadm doesn't validate the existing certificate Authority more than this;
+		// Basically, if we find a certificate file with the same path; and it is a CA
+		// kubeadm thinks those files are equal and doesn't bother writing a new file
+		fmt.Printf("[certs] Using the existing %q certificate and key\n", baseName)
 	} else {
-		// The certificate and the key did NOT exist, let's generate them now
-		caCert, caKey, err = pkiutil.NewCertificateAuthority()
-		if err != nil {
-			return fmt.Errorf("failure while generating CA certificate and key [%v]", err)
-		}
+		// Write .crt and .key files to disk
+		fmt.Printf("[certs] Generating %q certificate and key\n", baseName)
 
-		if err = pkiutil.WriteCertAndKey(pkiDir, kubeadmconstants.CACertAndKeyBaseName, caCert, caKey); err != nil {
-			return fmt.Errorf("failure while saving CA certificate and key [%v]", err)
+		if err := pkiutil.WriteCertAndKey(pkiDir, baseName, caCert, caKey); err != nil {
+			return errors.Wrapf(err, "failure while saving %s certificate and key", baseName)
 		}
-		fmt.Println("[certificates] Generated CA certificate and key.")
 	}
+	return nil
+}
 
-	// If at least one of them exists, we should try to load them
-	// In the case that only one exists, there will most likely be an error anyway
-	if pkiutil.CertOrKeyExist(pkiDir, kubeadmconstants.APIServerCertAndKeyBaseName) {
-		// Try to load apiserver.crt and apiserver.key from the PKI directory
-		apiCert, apiKey, err := pkiutil.TryLoadCertAndKeyFromDisk(pkiDir, kubeadmconstants.APIServerCertAndKeyBaseName)
-		if err != nil || apiCert == nil || apiKey == nil {
-			return fmt.Errorf("certificate and/or key existed but they could not be loaded properly")
+// writeCertificateFilesIfNotExist write a new certificate to the given path.
+// If there already is a certificate file at the given path; kubeadm tries to load it and check if the values in the
+// existing and the expected certificate equals. If they do; kubeadm will just skip writing the file as it's up-to-date,
+// otherwise this function returns an error.
+func writeCertificateFilesIfNotExist(pkiDir string, baseName string, signingCert *x509.Certificate, cert *x509.Certificate, key crypto.Signer, cfg *certutil.Config) error {
+
+	// Checks if the signed certificate exists in the PKI directory
+	if pkiutil.CertOrKeyExist(pkiDir, baseName) {
+		// Try to load signed certificate .crt and .key from the PKI directory
+		signedCert, _, err := pkiutil.TryLoadCertAndKeyFromDisk(pkiDir, baseName)
+		if err != nil {
+			return errors.Wrapf(err, "failure loading %s certificate", baseName)
 		}
 
-		fmt.Println("[certificates] Using the existing API Server certificate and key.")
+		// Check if the existing cert is signed by the given CA
+		if err := signedCert.CheckSignatureFrom(signingCert); err != nil {
+			return errors.Errorf("certificate %s is not signed by corresponding CA", baseName)
+		}
+
+		// Check if the certificate has the correct attributes
+		if err := validateCertificateWithConfig(signedCert, baseName, cfg); err != nil {
+			return err
+		}
+
+		fmt.Printf("[certs] Using the existing %q certificate and key\n", baseName)
 	} else {
-		// The certificate and the key did NOT exist, let's generate them now
-		// TODO: Add a test case to verify that this cert has the x509.ExtKeyUsageServerAuth flag
-		config := certutil.Config{
-			CommonName: "kube-apiserver",
-			AltNames:   altNames,
-			Usages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		}
-		apiCert, apiKey, err := pkiutil.NewCertAndKey(caCert, caKey, config)
-		if err != nil {
-			return fmt.Errorf("failure while creating API server key and certificate [%v]", err)
-		}
+		// Write .crt and .key files to disk
+		fmt.Printf("[certs] Generating %q certificate and key\n", baseName)
 
-		if err = pkiutil.WriteCertAndKey(pkiDir, kubeadmconstants.APIServerCertAndKeyBaseName, apiCert, apiKey); err != nil {
-			return fmt.Errorf("failure while saving API server certificate and key [%v]", err)
+		if err := pkiutil.WriteCertAndKey(pkiDir, baseName, cert, key); err != nil {
+			return errors.Wrapf(err, "failure while saving %s certificate and key", baseName)
 		}
-		fmt.Println("[certificates] Generated API server certificate and key.")
-		fmt.Printf("[certificates] API Server serving cert is signed for DNS names %v and IPs %v\n", altNames.DNSNames, altNames.IPs)
+		if pkiutil.HasServerAuth(cert) {
+			fmt.Printf("[certs] %s serving cert is signed for DNS names %v and IPs %v\n", baseName, cert.DNSNames, cert.IPAddresses)
+		}
 	}
-
-	// If at least one of them exists, we should try to load them
-	// In the case that only one exists, there will most likely be an error anyway
-	if pkiutil.CertOrKeyExist(pkiDir, kubeadmconstants.APIServerKubeletClientCertAndKeyBaseName) {
-		// Try to load apiserver-kubelet-client.crt and apiserver-kubelet-client.key from the PKI directory
-		apiCert, apiKey, err := pkiutil.TryLoadCertAndKeyFromDisk(pkiDir, kubeadmconstants.APIServerKubeletClientCertAndKeyBaseName)
-		if err != nil || apiCert == nil || apiKey == nil {
-			return fmt.Errorf("certificate and/or key existed but they could not be loaded properly")
-		}
-
-		fmt.Println("[certificates] Using the existing API Server kubelet client certificate and key.")
-	} else {
-		// The certificate and the key did NOT exist, let's generate them now
-		// TODO: Add a test case to verify that this cert has the x509.ExtKeyUsageClientAuth flag
-		config := certutil.Config{
-			CommonName:   "kube-apiserver-kubelet-client",
-			Organization: []string{kubeadmconstants.MastersGroup},
-			Usages:       []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
-		}
-		apiClientCert, apiClientKey, err := pkiutil.NewCertAndKey(caCert, caKey, config)
-		if err != nil {
-			return fmt.Errorf("failure while creating API server kubelet client key and certificate [%v]", err)
-		}
-
-		if err = pkiutil.WriteCertAndKey(pkiDir, kubeadmconstants.APIServerKubeletClientCertAndKeyBaseName, apiClientCert, apiClientKey); err != nil {
-			return fmt.Errorf("failure while saving API server kubelet client certificate and key [%v]", err)
-		}
-		fmt.Println("[certificates] Generated API server kubelet client certificate and key.")
-	}
-
-	// If the key exists, we should try to load it
-	if pkiutil.CertOrKeyExist(pkiDir, kubeadmconstants.ServiceAccountKeyBaseName) {
-		// Try to load sa.key from the PKI directory
-		_, err := pkiutil.TryLoadKeyFromDisk(pkiDir, kubeadmconstants.ServiceAccountKeyBaseName)
-		if err != nil {
-			return fmt.Errorf("certificate and/or key existed but they could not be loaded properly [%v]", err)
-		}
-
-		fmt.Println("[certificates] Using the existing service account token signing key.")
-	} else {
-		// The key does NOT exist, let's generate it now
-		saTokenSigningKey, err := certutil.NewPrivateKey()
-		if err != nil {
-			return fmt.Errorf("failure while creating service account token signing key [%v]", err)
-		}
-
-		if err = pkiutil.WriteKey(pkiDir, kubeadmconstants.ServiceAccountKeyBaseName, saTokenSigningKey); err != nil {
-			return fmt.Errorf("failure while saving service account token signing key [%v]", err)
-		}
-
-		if err = pkiutil.WritePublicKey(pkiDir, kubeadmconstants.ServiceAccountKeyBaseName, &saTokenSigningKey.PublicKey); err != nil {
-			return fmt.Errorf("failure while saving service account token signing public key [%v]", err)
-		}
-		fmt.Println("[certificates] Generated service account token signing key and public key.")
-	}
-
-	// front proxy CA and client certs are used to secure a front proxy authenticator which is used to assert identity
-	// without the client cert, you cannot make use of the front proxy and the kube-aggregator uses this connection
-	// so we generate and enable it unconditionally
-	// This is a separte CA, so that front proxy identities cannot hit the API and normal client certs cannot be used
-	// as front proxies.
-	var frontProxyCACert *x509.Certificate
-	var frontProxyCAKey *rsa.PrivateKey
-	// If at least one of them exists, we should try to load them
-	// In the case that only one exists, there will most likely be an error anyway
-	if pkiutil.CertOrKeyExist(pkiDir, kubeadmconstants.FrontProxyCACertAndKeyBaseName) {
-		// Try to load front-proxy-ca.crt and front-proxy-ca.key from the PKI directory
-		frontProxyCACert, frontProxyCAKey, err = pkiutil.TryLoadCertAndKeyFromDisk(pkiDir, kubeadmconstants.FrontProxyCACertAndKeyBaseName)
-		if err != nil || frontProxyCACert == nil || frontProxyCAKey == nil {
-			return fmt.Errorf("certificate and/or key existed but they could not be loaded properly")
-		}
-
-		// The certificate and key could be loaded, but the certificate is not a CA
-		if !frontProxyCACert.IsCA {
-			return fmt.Errorf("certificate and key could be loaded but the certificate is not a CA")
-		}
-
-		fmt.Println("[certificates] Using the existing front-proxy CA certificate and key.")
-	} else {
-		// The certificate and the key did NOT exist, let's generate them now
-		frontProxyCACert, frontProxyCAKey, err = pkiutil.NewCertificateAuthority()
-		if err != nil {
-			return fmt.Errorf("failure while generating front-proxy CA certificate and key [%v]", err)
-		}
-
-		if err = pkiutil.WriteCertAndKey(pkiDir, kubeadmconstants.FrontProxyCACertAndKeyBaseName, frontProxyCACert, frontProxyCAKey); err != nil {
-			return fmt.Errorf("failure while saving front-proxy CA certificate and key [%v]", err)
-		}
-		fmt.Println("[certificates] Generated front-proxy CA certificate and key.")
-	}
-
-	// At this point we have a front proxy CA signing key.  We can use that create the front proxy client cert if
-	// it doesn't already exist.
-	// If at least one of them exists, we should try to load them
-	// In the case that only one exists, there will most likely be an error anyway
-	if pkiutil.CertOrKeyExist(pkiDir, kubeadmconstants.FrontProxyClientCertAndKeyBaseName) {
-		// Try to load apiserver-kubelet-client.crt and apiserver-kubelet-client.key from the PKI directory
-		apiCert, apiKey, err := pkiutil.TryLoadCertAndKeyFromDisk(pkiDir, kubeadmconstants.FrontProxyClientCertAndKeyBaseName)
-		if err != nil || apiCert == nil || apiKey == nil {
-			return fmt.Errorf("certificate and/or key existed but they could not be loaded properly")
-		}
-
-		fmt.Println("[certificates] Using the existing front-proxy client certificate and key.")
-	} else {
-		// The certificate and the key did NOT exist, let's generate them now
-		// TODO: Add a test case to verify that this cert has the x509.ExtKeyUsageClientAuth flag
-		config := certutil.Config{
-			CommonName: "front-proxy-client",
-			Usages:     []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
-		}
-		apiClientCert, apiClientKey, err := pkiutil.NewCertAndKey(frontProxyCACert, frontProxyCAKey, config)
-		if err != nil {
-			return fmt.Errorf("failure while creating front-proxy client key and certificate [%v]", err)
-		}
-
-		if err = pkiutil.WriteCertAndKey(pkiDir, kubeadmconstants.FrontProxyClientCertAndKeyBaseName, apiClientCert, apiClientKey); err != nil {
-			return fmt.Errorf("failure while saving front-proxy client certificate and key [%v]", err)
-		}
-		fmt.Println("[certificates] Generated front-proxy client certificate and key.")
-	}
-
-	fmt.Printf("[certificates] Valid certificates and keys now exist in %q\n", pkiDir)
 
 	return nil
 }
 
-// checkAltNamesExist verifies that the cert is valid for all IPs and DNS names it should be valid for
-func checkAltNamesExist(IPs []net.IP, DNSNames []string, altNames certutil.AltNames) bool {
-	dnsset := setutil.NewString(DNSNames...)
+// writeCSRFilesIfNotExist writes a new CSR to the given path.
+// If there already is a CSR file at the given path; kubeadm tries to load it and check if it's a valid certificate.
+// otherwise this function returns an error.
+func writeCSRFilesIfNotExist(csrDir string, baseName string, csr *x509.CertificateRequest, key crypto.Signer) error {
+	if pkiutil.CSROrKeyExist(csrDir, baseName) {
+		_, _, err := pkiutil.TryLoadCSRAndKeyFromDisk(csrDir, baseName)
+		if err != nil {
+			return errors.Wrapf(err, "%s CSR existed but it could not be loaded properly", baseName)
+		}
 
-	for _, dnsNameThatShouldExist := range altNames.DNSNames {
-		if !dnsset.Has(dnsNameThatShouldExist) {
-			return false
+		fmt.Printf("[certs] Using the existing %q CSR\n", baseName)
+	} else {
+		// Write .key and .csr files to disk
+		fmt.Printf("[certs] Generating %q key and CSR\n", baseName)
+
+		if err := pkiutil.WriteKey(csrDir, baseName, key); err != nil {
+			return errors.Wrapf(err, "failure while saving %s key", baseName)
+		}
+
+		if err := pkiutil.WriteCSR(csrDir, baseName, csr); err != nil {
+			return errors.Wrapf(err, "failure while saving %s CSR", baseName)
 		}
 	}
 
-	for _, ipThatShouldExist := range altNames.IPs {
-		found := false
-		for _, ip := range IPs {
-			if ip.Equal(ipThatShouldExist) {
-				found = true
-				break
-			}
-		}
-
-		if !found {
-			return false
-		}
-	}
-	return true
+	return nil
 }
 
-// getAltNames builds an AltNames object for the certutil to use when generating the certificates
-func getAltNames(cfgAltNames []string, hostname, dnsdomain string, svcSubnet *net.IPNet) certutil.AltNames {
-	altNames := certutil.AltNames{
-		DNSNames: []string{
-			hostname,
-			"kubernetes",
-			"kubernetes.default",
-			"kubernetes.default.svc",
-			fmt.Sprintf("kubernetes.default.svc.%s", dnsdomain),
-		},
+type certKeyLocation struct {
+	pkiDir     string
+	caBaseName string
+	baseName   string
+	uxName     string
+}
+
+// SharedCertificateExists verifies if the shared certificates - the certificates that must be
+// equal across control-plane nodes: ca.key, ca.crt, sa.key, sa.pub + etcd/ca.key, etcd/ca.crt if local/stacked etcd
+func SharedCertificateExists(cfg *kubeadmapi.ClusterConfiguration) (bool, error) {
+
+	if err := validateCACertAndKey(certKeyLocation{cfg.CertificatesDir, kubeadmconstants.CACertAndKeyBaseName, "", "CA"}); err != nil {
+		return false, err
 	}
 
-	// Populate IPs/DNSNames from AltNames
-	for _, altname := range cfgAltNames {
-		if ip := net.ParseIP(altname); ip != nil {
-			altNames.IPs = append(altNames.IPs, ip)
-		} else if len(validation.IsDNS1123Subdomain(altname)) == 0 {
-			altNames.DNSNames = append(altNames.DNSNames, altname)
+	if err := validatePrivatePublicKey(certKeyLocation{cfg.CertificatesDir, "", kubeadmconstants.ServiceAccountKeyBaseName, "service account"}); err != nil {
+		return false, err
+	}
+
+	if err := validateCACertAndKey(certKeyLocation{cfg.CertificatesDir, kubeadmconstants.FrontProxyCACertAndKeyBaseName, "", "front-proxy CA"}); err != nil {
+		return false, err
+	}
+
+	// in case of local/stacked etcd
+	if cfg.Etcd.External == nil {
+		if err := validateCACertAndKey(certKeyLocation{cfg.CertificatesDir, kubeadmconstants.EtcdCACertAndKeyBaseName, "", "etcd CA"}); err != nil {
+			return false, err
 		}
 	}
 
-	// and lastly, extract the internal IP address for the API server
-	internalAPIServerVirtualIP, err := ipallocator.GetIndexedIP(svcSubnet, 1)
-	if err != nil {
-		fmt.Printf("[certs] WARNING: Unable to get first IP address from the given CIDR (%s): %v\n", svcSubnet.String(), err)
+	return true, nil
+}
+
+// UsingExternalCA determines whether the user is relying on an external CA.  We currently implicitly determine this is the case
+// when the CA Cert is present but the CA Key is not.
+// This allows us to, e.g., skip generating certs or not start the csr signing controller.
+// In case we are using an external front-proxy CA, the function validates the certificates signed by front-proxy CA that should be provided by the user.
+func UsingExternalCA(cfg *kubeadmapi.ClusterConfiguration) (bool, error) {
+
+	if err := validateCACert(certKeyLocation{cfg.CertificatesDir, kubeadmconstants.CACertAndKeyBaseName, "", "CA"}); err != nil {
+		return false, err
 	}
-	altNames.IPs = append(altNames.IPs, internalAPIServerVirtualIP)
-	return altNames
+
+	caKeyPath := filepath.Join(cfg.CertificatesDir, kubeadmconstants.CAKeyName)
+	if _, err := os.Stat(caKeyPath); !os.IsNotExist(err) {
+		return false, nil
+	}
+
+	if err := validateSignedCert(certKeyLocation{cfg.CertificatesDir, kubeadmconstants.CACertAndKeyBaseName, kubeadmconstants.APIServerCertAndKeyBaseName, "API server"}); err != nil {
+		return true, err
+	}
+
+	if err := validateSignedCert(certKeyLocation{cfg.CertificatesDir, kubeadmconstants.CACertAndKeyBaseName, kubeadmconstants.APIServerKubeletClientCertAndKeyBaseName, "API server kubelet client"}); err != nil {
+		return true, err
+	}
+
+	return true, nil
+}
+
+// UsingExternalFrontProxyCA determines whether the user is relying on an external front-proxy CA.  We currently implicitly determine this is the case
+// when the front proxy CA Cert is present but the front proxy CA Key is not.
+// In case we are using an external front-proxy CA, the function validates the certificates signed by front-proxy CA that should be provided by the user.
+func UsingExternalFrontProxyCA(cfg *kubeadmapi.ClusterConfiguration) (bool, error) {
+
+	if err := validateCACert(certKeyLocation{cfg.CertificatesDir, kubeadmconstants.FrontProxyCACertAndKeyBaseName, "", "front-proxy CA"}); err != nil {
+		return false, err
+	}
+
+	frontProxyCAKeyPath := filepath.Join(cfg.CertificatesDir, kubeadmconstants.FrontProxyCAKeyName)
+	if _, err := os.Stat(frontProxyCAKeyPath); !os.IsNotExist(err) {
+		return false, nil
+	}
+
+	if err := validateSignedCert(certKeyLocation{cfg.CertificatesDir, kubeadmconstants.FrontProxyCACertAndKeyBaseName, kubeadmconstants.FrontProxyClientCertAndKeyBaseName, "front-proxy client"}); err != nil {
+		return true, err
+	}
+
+	return true, nil
+}
+
+// validateCACert tries to load a x509 certificate from pkiDir and validates that it is a CA
+func validateCACert(l certKeyLocation) error {
+	// Check CA Cert
+	caCert, err := pkiutil.TryLoadCertFromDisk(l.pkiDir, l.caBaseName)
+	if err != nil {
+		return errors.Wrapf(err, "failure loading certificate for %s", l.uxName)
+	}
+
+	// Check if cert is a CA
+	if !caCert.IsCA {
+		return errors.Errorf("certificate %s is not a CA", l.uxName)
+	}
+	return nil
+}
+
+// validateCACertAndKey tries to load a x509 certificate and private key from pkiDir,
+// and validates that the cert is a CA
+func validateCACertAndKey(l certKeyLocation) error {
+	if err := validateCACert(l); err != nil {
+		return err
+	}
+
+	_, err := pkiutil.TryLoadKeyFromDisk(l.pkiDir, l.caBaseName)
+	if err != nil {
+		return errors.Wrapf(err, "failure loading key for %s", l.uxName)
+	}
+	return nil
+}
+
+// validateSignedCert tries to load a x509 certificate and private key from pkiDir and validates
+// that the cert is signed by a given CA
+func validateSignedCert(l certKeyLocation) error {
+	// Try to load CA
+	caCert, err := pkiutil.TryLoadCertFromDisk(l.pkiDir, l.caBaseName)
+	if err != nil {
+		return errors.Wrapf(err, "failure loading certificate authority for %s", l.uxName)
+	}
+
+	return validateSignedCertWithCA(l, caCert)
+}
+
+// validateSignedCertWithCA tries to load a certificate and validate it with the given caCert
+func validateSignedCertWithCA(l certKeyLocation, caCert *x509.Certificate) error {
+	// Try to load key and signed certificate
+	signedCert, _, err := pkiutil.TryLoadCertAndKeyFromDisk(l.pkiDir, l.baseName)
+	if err != nil {
+		return errors.Wrapf(err, "failure loading certificate for %s", l.uxName)
+	}
+
+	// Check if the cert is signed by the CA
+	if err := signedCert.CheckSignatureFrom(caCert); err != nil {
+		return errors.Wrapf(err, "certificate %s is not signed by corresponding CA", l.uxName)
+	}
+	return nil
+}
+
+// validatePrivatePublicKey tries to load a private key from pkiDir
+func validatePrivatePublicKey(l certKeyLocation) error {
+	// Try to load key
+	_, _, err := pkiutil.TryLoadPrivatePublicKeyFromDisk(l.pkiDir, l.baseName)
+	if err != nil {
+		return errors.Wrapf(err, "failure loading key for %s", l.uxName)
+	}
+	return nil
+}
+
+// validateCertificateWithConfig makes sure that a given certificate is valid at
+// least for the SANs defined in the configuration.
+func validateCertificateWithConfig(cert *x509.Certificate, baseName string, cfg *certutil.Config) error {
+	for _, dnsName := range cfg.AltNames.DNSNames {
+		if err := cert.VerifyHostname(dnsName); err != nil {
+			return errors.Wrapf(err, "certificate %s is invalid", baseName)
+		}
+	}
+	for _, ipAddress := range cfg.AltNames.IPs {
+		if err := cert.VerifyHostname(ipAddress.String()); err != nil {
+			return errors.Wrapf(err, "certificate %s is invalid", baseName)
+		}
+	}
+	return nil
 }

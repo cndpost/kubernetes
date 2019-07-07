@@ -1,27 +1,22 @@
-package(default_visibility = ["//visibility:public"])
-
-licenses(["notice"])
-
-load(
-    "@io_bazel_rules_go//go:def.bzl",
-    "go_library",
-)
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "go_default_library",
     srcs = [
         "accessors.go",
-        "constants.go",
         "conversions.go",
         "doc.go",
         "map.go",
         "mutations.go",
         "security.go",
         "tests.go",
+        "type_specific.go",
         "type_specific_codegen.go",
         "value.go",
     ],
-    tags = ["automanaged"],
+    importmap = "k8s.io/kubernetes/vendor/github.com/stretchr/objx",
+    importpath = "github.com/stretchr/objx",
+    visibility = ["//visibility:public"],
 )
 
 filegroup(
@@ -35,4 +30,5 @@ filegroup(
     name = "all-srcs",
     srcs = [":package-srcs"],
     tags = ["automanaged"],
+    visibility = ["//visibility:public"],
 )

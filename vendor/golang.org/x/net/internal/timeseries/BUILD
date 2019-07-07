@@ -1,16 +1,11 @@
-package(default_visibility = ["//visibility:public"])
-
-licenses(["notice"])
-
-load(
-    "@io_bazel_rules_go//go:def.bzl",
-    "go_library",
-)
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "go_default_library",
     srcs = ["timeseries.go"],
-    tags = ["automanaged"],
+    importmap = "k8s.io/kubernetes/vendor/golang.org/x/net/internal/timeseries",
+    importpath = "golang.org/x/net/internal/timeseries",
+    visibility = ["//vendor/golang.org/x/net:__subpackages__"],
 )
 
 filegroup(
@@ -24,4 +19,5 @@ filegroup(
     name = "all-srcs",
     srcs = [":package-srcs"],
     tags = ["automanaged"],
+    visibility = ["//visibility:public"],
 )

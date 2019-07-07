@@ -22,8 +22,10 @@ import (
 )
 
 var (
+	// SchemeBuilder is a pointer used to call AddToScheme
 	SchemeBuilder = runtime.NewSchemeBuilder(addKnownTypes)
-	AddToScheme   = SchemeBuilder.AddToScheme
+	// AddToScheme is used to register the types to API encoding/decoding machinery
+	AddToScheme = SchemeBuilder.AddToScheme
 )
 
 // GroupName is the group name use in this package
@@ -49,5 +51,3 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 	)
 	return nil
 }
-
-func (obj *Configuration) GetObjectKind() schema.ObjectKind { return &obj.TypeMeta }

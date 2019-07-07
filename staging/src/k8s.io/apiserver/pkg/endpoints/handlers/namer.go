@@ -20,14 +20,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/endpoints/request"
 )
-
-// ContextFunc returns a Context given a request - a context must be returned
-type ContextFunc func(req *http.Request) request.Context
 
 // ScopeNamer handles accessing names from requests and objects
 type ScopeNamer interface {
@@ -45,13 +43,12 @@ type ScopeNamer interface {
 	SetSelfLink(obj runtime.Object, url string) error
 	// GenerateLink creates an encoded URI for a given runtime object that represents the canonical path
 	// and query.
-	GenerateLink(req *http.Request, obj runtime.Object) (uri string, err error)
+	GenerateLink(requestInfo *request.RequestInfo, obj runtime.Object) (uri string, err error)
 	// GenerateListLink creates an encoded URI for a list that represents the canonical path and query.
 	GenerateListLink(req *http.Request) (uri string, err error)
 }
 
 type ContextBasedNaming struct {
-	GetContext    ContextFunc
 	SelfLinker    runtime.SelfLinker
 	ClusterScoped bool
 
@@ -67,7 +64,7 @@ func (n ContextBasedNaming) SetSelfLink(obj runtime.Object, url string) error {
 }
 
 func (n ContextBasedNaming) Namespace(req *http.Request) (namespace string, err error) {
-	requestInfo, ok := request.RequestInfoFrom(n.GetContext(req))
+	requestInfo, ok := request.RequestInfoFrom(req.Context())
 	if !ok {
 		return "", fmt.Errorf("missing requestInfo")
 	}
@@ -75,7 +72,7 @@ func (n ContextBasedNaming) Namespace(req *http.Request) (namespace string, err 
 }
 
 func (n ContextBasedNaming) Name(req *http.Request) (namespace, name string, err error) {
-	requestInfo, ok := request.RequestInfoFrom(n.GetContext(req))
+	requestInfo, ok := request.RequestInfoFrom(req.Context())
 	if !ok {
 		return "", "", fmt.Errorf("missing requestInfo")
 	}
@@ -90,12 +87,22 @@ func (n ContextBasedNaming) Name(req *http.Request) (namespace, name string, err
 	return ns, requestInfo.Name, nil
 }
 
-func (n ContextBasedNaming) GenerateLink(req *http.Request, obj runtime.Object) (uri string, err error) {
-	requestInfo, ok := request.RequestInfoFrom(n.GetContext(req))
-	if !ok {
-		return "", fmt.Errorf("missing requestInfo")
+// fastURLPathEncode encodes the provided path as a URL path
+func fastURLPathEncode(path string) string {
+	for _, r := range []byte(path) {
+		switch {
+		case r >= '-' && r <= '9', r >= 'A' && r <= 'Z', r >= 'a' && r <= 'z':
+			// characters within this range do not require escaping
+		default:
+			var u url.URL
+			u.Path = path
+			return u.EscapedPath()
+		}
 	}
+	return path
+}
 
+func (n ContextBasedNaming) GenerateLink(requestInfo *request.RequestInfo, obj runtime.Object) (uri string, err error) {
 	namespace, name, err := n.ObjectName(obj)
 	if err == errEmptyName && len(requestInfo.Name) > 0 {
 		name = requestInfo.Name
@@ -110,19 +117,23 @@ func (n ContextBasedNaming) GenerateLink(req *http.Request, obj runtime.Object) 
 		return n.SelfLinkPathPrefix + url.QueryEscape(name) + n.SelfLinkPathSuffix, nil
 	}
 
-	return n.SelfLinkPathPrefix +
-			url.QueryEscape(namespace) +
-			"/" + url.QueryEscape(requestInfo.Resource) + "/" +
-			url.QueryEscape(name) +
-			n.SelfLinkPathSuffix,
-		nil
+	builder := strings.Builder{}
+	builder.Grow(len(n.SelfLinkPathPrefix) + len(namespace) + len(requestInfo.Resource) + len(name) + len(n.SelfLinkPathSuffix) + 8)
+	builder.WriteString(n.SelfLinkPathPrefix)
+	builder.WriteString(namespace)
+	builder.WriteByte('/')
+	builder.WriteString(requestInfo.Resource)
+	builder.WriteByte('/')
+	builder.WriteString(name)
+	builder.WriteString(n.SelfLinkPathSuffix)
+	return fastURLPathEncode(builder.String()), nil
 }
 
 func (n ContextBasedNaming) GenerateListLink(req *http.Request) (uri string, err error) {
 	if len(req.URL.RawPath) > 0 {
 		return req.URL.RawPath, nil
 	}
-	return req.URL.EscapedPath(), nil
+	return fastURLPathEncode(req.URL.Path), nil
 }
 
 func (n ContextBasedNaming) ObjectName(obj runtime.Object) (namespace, name string, err error) {

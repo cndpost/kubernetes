@@ -27,14 +27,14 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	genericapiserver "k8s.io/apiserver/pkg/server"
-	"k8s.io/kubernetes/pkg/api"
-	openapigen "k8s.io/kubernetes/pkg/generated/openapi"
-
 	"github.com/go-openapi/loads"
 	"github.com/go-openapi/spec"
 	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/validate"
+	openapinamer "k8s.io/apiserver/pkg/endpoints/openapi"
+	genericapiserver "k8s.io/apiserver/pkg/server"
+	"k8s.io/kubernetes/pkg/api/legacyscheme"
+	openapigen "k8s.io/kubernetes/pkg/generated/openapi"
 )
 
 // TestValidOpenAPISpec verifies that the open api is added
@@ -44,24 +44,23 @@ func TestValidOpenAPISpec(t *testing.T) {
 	defer etcdserver.Terminate(t)
 
 	config.GenericConfig.EnableIndex = true
-	config.GenericConfig.OpenAPIConfig = genericapiserver.DefaultOpenAPIConfig(openapigen.GetOpenAPIDefinitions, api.Scheme)
+	config.GenericConfig.OpenAPIConfig = genericapiserver.DefaultOpenAPIConfig(openapigen.GetOpenAPIDefinitions, openapinamer.NewDefinitionNamer(legacyscheme.Scheme))
 	config.GenericConfig.OpenAPIConfig.Info = &spec.Info{
 		InfoProps: spec.InfoProps{
 			Title:   "Kubernetes",
 			Version: "unversioned",
 		},
 	}
-	config.GenericConfig.SwaggerConfig = genericapiserver.DefaultSwaggerConfig()
 
-	master, err := config.Complete().New()
+	master, err := config.Complete().New(genericapiserver.NewEmptyDelegate())
 	if err != nil {
 		t.Fatalf("Error in bringing up the master: %v", err)
 	}
 
 	// make sure swagger.json is not registered before calling PrepareRun.
-	server := httptest.NewServer(master.GenericAPIServer.HandlerContainer.ServeMux)
+	server := httptest.NewServer(master.GenericAPIServer.Handler.Director)
 	defer server.Close()
-	resp, err := http.Get(server.URL + "/swagger.json")
+	resp, err := http.Get(server.URL + "/openapi/v2")
 	if !assert.NoError(err) {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -69,7 +68,7 @@ func TestValidOpenAPISpec(t *testing.T) {
 
 	master.GenericAPIServer.PrepareRun()
 
-	resp, err = http.Get(server.URL + "/swagger.json")
+	resp, err = http.Get(server.URL + "/openapi/v2")
 	if !assert.NoError(err) {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -84,7 +83,7 @@ func TestValidOpenAPISpec(t *testing.T) {
 	}
 
 	// Validate OpenApi spec
-	doc, err := loads.Spec(server.URL + "/swagger.json")
+	doc, err := loads.Spec(server.URL + "/openapi/v2")
 	if assert.NoError(err) {
 		validator := validate.NewSpecValidator(doc.Schema(), strfmt.Default)
 		res, warns := validator.Validate(doc)

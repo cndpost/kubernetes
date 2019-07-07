@@ -23,6 +23,7 @@ import (
 	libcontainerutils "github.com/opencontainers/runc/libcontainer/utils"
 )
 
+// GetPids gets pids of the desired cgroup
 // Forked from opencontainers/runc/libcontainer/cgroup/fs.Manager.GetPids()
 func GetPids(cgroupPath string) ([]int, error) {
 	dir, err := getCgroupPath(cgroupPath)
@@ -37,7 +38,7 @@ func GetPids(cgroupPath string) ([]int, error) {
 func getCgroupPath(cgroupPath string) (string, error) {
 	cgroupPath = libcontainerutils.CleanPath(cgroupPath)
 
-	mnt, root, err := libcontainercgroups.FindCgroupMountpointAndRoot("devices")
+	mnt, root, err := libcontainercgroups.FindCgroupMountpointAndRoot(cgroupPath, "devices")
 	// If we didn't mount the subsystem, there is no point we make the path.
 	if err != nil {
 		return "", err
@@ -45,7 +46,7 @@ func getCgroupPath(cgroupPath string) (string, error) {
 
 	// If the cgroup name/path is absolute do not look relative to the cgroup of the init process.
 	if filepath.IsAbs(cgroupPath) {
-		// Sometimes subsystems can be mounted togethger as 'cpu,cpuacct'.
+		// Sometimes subsystems can be mounted together as 'cpu,cpuacct'.
 		return filepath.Join(root, mnt, cgroupPath), nil
 	}
 
@@ -62,7 +63,7 @@ func getCgroupParentPath(mountpoint, root string) (string, error) {
 	// Use GetThisCgroupDir instead of GetInitCgroupDir, because the creating
 	// process could in container and shared pid namespace with host, and
 	// /proc/1/cgroup could point to whole other world of cgroups.
-	initPath, err := libcontainercgroups.GetThisCgroupDir("devices")
+	initPath, err := libcontainercgroups.GetOwnCgroup("devices")
 	if err != nil {
 		return "", err
 	}

@@ -21,8 +21,8 @@ import (
 	"testing"
 
 	"github.com/davecgh/go-spew/spew"
+	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/kubernetes/pkg/api/v1"
 )
 
 func podRef(uid string) *v1.ObjectReference {
@@ -51,11 +51,11 @@ func TestPackSubsets(t *testing.T) {
 		}, {
 			name:   "empty ports",
 			given:  []v1.EndpointSubset{{Addresses: []v1.EndpointAddress{{IP: "1.2.3.4"}}, Ports: []v1.EndpointPort{}}},
-			expect: []v1.EndpointSubset{},
+			expect: []v1.EndpointSubset{{Addresses: []v1.EndpointAddress{{IP: "1.2.3.4"}}, Ports: nil}},
 		}, {
 			name:   "empty ports",
 			given:  []v1.EndpointSubset{{NotReadyAddresses: []v1.EndpointAddress{{IP: "1.2.3.4"}}, Ports: []v1.EndpointPort{}}},
-			expect: []v1.EndpointSubset{},
+			expect: []v1.EndpointSubset{{NotReadyAddresses: []v1.EndpointAddress{{IP: "1.2.3.4"}}, Ports: nil}},
 		}, {
 			name: "one set, one ip, one port",
 			given: []v1.EndpointSubset{{

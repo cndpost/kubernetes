@@ -5,20 +5,15 @@ package restful
 // that can be found in the LICENSE file.
 
 import (
-	"bytes"
 	"compress/zlib"
-	"io/ioutil"
 	"net/http"
 )
 
 var defaultRequestContentType string
 
-var doCacheReadEntityBytes = false
-
 // Request is a wrapper for a http Request that provides convenience methods
 type Request struct {
 	Request           *http.Request
-	bodyContent       *[]byte // to cache the request body for multiple reads of ReadEntity
 	pathParameters    map[string]string
 	attributes        map[string]interface{} // for storing request-scoped values
 	selectedRoutePath string                 // root path + route path that matched the request, e.g. /meetings/{id}/attendees
@@ -41,12 +36,6 @@ func DefaultRequestContentType(mime string) {
 	defaultRequestContentType = mime
 }
 
-// SetCacheReadEntity controls whether the response data ([]byte) is cached such that ReadEntity is repeatable.
-// Default is true (due to backwardcompatibility). For better performance, you should set it to false if you don't need it.
-func SetCacheReadEntity(doCache bool) {
-	doCacheReadEntityBytes = doCache
-}
-
 // PathParameter accesses the Path parameter value by its name
 func (r *Request) PathParameter(name string) string {
 	return r.pathParameters[name]
@@ -60,6 +49,11 @@ func (r *Request) PathParameters() map[string]string {
 // QueryParameter returns the (first) Query parameter value by its name
 func (r *Request) QueryParameter(name string) string {
 	return r.Request.FormValue(name)
+}
+
+// QueryParameters returns the all the query parameters values by name
+func (r *Request) QueryParameters(name string) []string {
+	return r.Request.URL.Query()[name]
 }
 
 // BodyParameter parses the body of the request (once for typically a POST or a PUT) and returns the value of the given name or an error.
@@ -80,18 +74,6 @@ func (r *Request) HeaderParameter(name string) string {
 func (r *Request) ReadEntity(entityPointer interface{}) (err error) {
 	contentType := r.Request.Header.Get(HEADER_ContentType)
 	contentEncoding := r.Request.Header.Get(HEADER_ContentEncoding)
-
-	// OLD feature, cache the body for reads
-	if doCacheReadEntityBytes {
-		if r.bodyContent == nil {
-			data, err := ioutil.ReadAll(r.Request.Body)
-			if err != nil {
-				return err
-			}
-			r.bodyContent = &data
-		}
-		r.Request.Body = ioutil.NopCloser(bytes.NewReader(*r.bodyContent))
-	}
 
 	// check if the request body needs decompression
 	if ENCODING_GZIP == contentEncoding {

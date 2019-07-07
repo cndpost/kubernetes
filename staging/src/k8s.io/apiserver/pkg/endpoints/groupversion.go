@@ -17,22 +17,21 @@ limitations under the License.
 package endpoints
 
 import (
-	"fmt"
 	"path"
 	"time"
 
 	"github.com/emicklei/go-restful"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apiserver/pkg/admission"
+	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/apiserver/pkg/endpoints/discovery"
-	"k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/rest"
+	openapiproto "k8s.io/kube-openapi/pkg/util/proto"
 )
 
 // APIGroupVersion is a helper for exposing rest.Storage objects as http.Handlers via go-restful
@@ -58,7 +57,8 @@ type APIGroupVersion struct {
 	// version (for when the inevitable meta/v2 group emerges).
 	MetaGroupVersion *schema.GroupVersion
 
-	Mapper meta.RESTMapper
+	// RootScopedKinds are the root scoped kinds for the primary GroupVersion
+	RootScopedKinds sets.String
 
 	// Serializer is used to determine how to convert responses from API methods into bytes to send over
 	// the wire.
@@ -68,81 +68,50 @@ type APIGroupVersion struct {
 	Typer           runtime.ObjectTyper
 	Creater         runtime.ObjectCreater
 	Convertor       runtime.ObjectConvertor
-	Copier          runtime.ObjectCopier
 	Defaulter       runtime.ObjectDefaulter
 	Linker          runtime.SelfLinker
 	UnsafeConvertor runtime.ObjectConvertor
 
-	Admit   admission.Interface
-	Context request.RequestContextMapper
+	EquivalentResourceRegistry runtime.EquivalentResourceRegistry
+
+	// Authorizer determines whether a user is allowed to make a certain request. The Handler does a preliminary
+	// authorization check using the request URI but it may be necessary to make additional checks, such as in
+	// the create-on-update case
+	Authorizer authorizer.Authorizer
+
+	Admit admission.Interface
 
 	MinRequestTimeout time.Duration
 
-	// SubresourceGroupVersionKind contains the GroupVersionKind overrides for each subresource that is
-	// accessible from this API group version. The GroupVersionKind is that of the external version of
-	// the subresource. The key of this map should be the path of the subresource. The keys here should
-	// match the keys in the Storage map above for subresources.
-	SubresourceGroupVersionKind map[string]schema.GroupVersionKind
+	// EnableAPIResponseCompression indicates whether API Responses should support compression
+	// if the client requests it via Accept-Encoding
+	EnableAPIResponseCompression bool
 
-	// ResourceLister is an interface that knows how to list resources
-	// for this API Group.
-	ResourceLister discovery.APIResourceLister
+	// OpenAPIModels exposes the OpenAPI models to each individual handler.
+	OpenAPIModels openapiproto.Models
+
+	// The limit on the request body size that would be accepted and decoded in a write request.
+	// 0 means no limit.
+	MaxRequestBodyBytes int64
 }
 
 // InstallREST registers the REST handlers (storage, watch, proxy and redirect) into a restful Container.
 // It is expected that the provided path root prefix will serve all operations. Root MUST NOT end
 // in a slash.
 func (g *APIGroupVersion) InstallREST(container *restful.Container) error {
-	installer := g.newInstaller()
-	ws := installer.NewWebService()
-	apiResources, registrationErrors := installer.Install(ws)
-	lister := g.ResourceLister
-	if lister == nil {
-		lister = staticLister{apiResources}
+	prefix := path.Join(g.Root, g.GroupVersion.Group, g.GroupVersion.Version)
+	installer := &APIInstaller{
+		group:                        g,
+		prefix:                       prefix,
+		minRequestTimeout:            g.MinRequestTimeout,
+		enableAPIResponseCompression: g.EnableAPIResponseCompression,
 	}
-	versionDiscoveryHandler := discovery.NewAPIVersionHandler(g.Serializer, g.GroupVersion, lister)
+
+	apiResources, ws, registrationErrors := installer.Install()
+	versionDiscoveryHandler := discovery.NewAPIVersionHandler(g.Serializer, g.GroupVersion, staticLister{apiResources})
 	versionDiscoveryHandler.AddToWebService(ws)
 	container.Add(ws)
 	return utilerrors.NewAggregate(registrationErrors)
-}
-
-// UpdateREST registers the REST handlers for this APIGroupVersion to an existing web service
-// in the restful Container.  It will use the prefix (root/version) to find the existing
-// web service.  If a web service does not exist within the container to support the prefix
-// this method will return an error.
-func (g *APIGroupVersion) UpdateREST(container *restful.Container) error {
-	installer := g.newInstaller()
-	var ws *restful.WebService = nil
-
-	for i, s := range container.RegisteredWebServices() {
-		if s.RootPath() == installer.prefix {
-			ws = container.RegisteredWebServices()[i]
-			break
-		}
-	}
-
-	if ws == nil {
-		return apierrors.NewInternalError(fmt.Errorf("unable to find an existing webservice for prefix %s", installer.prefix))
-	}
-	apiResources, registrationErrors := installer.Install(ws)
-	lister := g.ResourceLister
-	if lister == nil {
-		lister = staticLister{apiResources}
-	}
-	versionDiscoveryHandler := discovery.NewAPIVersionHandler(g.Serializer, g.GroupVersion, lister)
-	versionDiscoveryHandler.AddToWebService(ws)
-	return utilerrors.NewAggregate(registrationErrors)
-}
-
-// newInstaller is a helper to create the installer.  Used by InstallREST and UpdateREST.
-func (g *APIGroupVersion) newInstaller() *APIInstaller {
-	prefix := path.Join(g.Root, g.GroupVersion.Group, g.GroupVersion.Version)
-	installer := &APIInstaller{
-		group:             g,
-		prefix:            prefix,
-		minRequestTimeout: g.MinRequestTimeout,
-	}
-	return installer
 }
 
 // staticLister implements the APIResourceLister interface

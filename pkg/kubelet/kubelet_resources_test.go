@@ -21,26 +21,15 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	cadvisorapi "github.com/google/cadvisor/info/v1"
-	cadvisorapiv2 "github.com/google/cadvisor/info/v2"
+	"k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/kubernetes/pkg/api/v1"
 )
 
 func TestPodResourceLimitsDefaulting(t *testing.T) {
-	cpuCores := resource.MustParse("10")
-	memoryCapacity := resource.MustParse("10Gi")
 	tk := newTestKubelet(t, true)
 	defer tk.Cleanup()
-	tk.fakeCadvisor.On("VersionInfo").Return(&cadvisorapi.VersionInfo{}, nil)
-	tk.fakeCadvisor.On("MachineInfo").Return(&cadvisorapi.MachineInfo{
-		NumCores:       int(cpuCores.Value()),
-		MemoryCapacity: uint64(memoryCapacity.Value()),
-	}, nil)
-	tk.fakeCadvisor.On("ImagesFsInfo").Return(cadvisorapiv2.FsInfo{}, nil)
-	tk.fakeCadvisor.On("RootFsInfo").Return(cadvisorapiv2.FsInfo{}, nil)
 	tk.kubelet.nodeInfo = &testNodeInfo{
 		nodes: []*v1.Node{
 			{
@@ -79,7 +68,7 @@ func TestPodResourceLimitsDefaulting(t *testing.T) {
 	}
 	as := assert.New(t)
 	for idx, tc := range cases {
-		actual, _, err := tk.kubelet.defaultPodLimitsForDownwardApi(tc.pod, nil)
+		actual, _, err := tk.kubelet.defaultPodLimitsForDownwardAPI(tc.pod, nil)
 		as.Nil(err, "failed to default pod limits: %v", err)
 		if !apiequality.Semantic.DeepEqual(tc.expected, actual) {
 			as.Fail("test case [%d] failed.  Expected: %+v, Got: %+v", idx, tc.expected, actual)

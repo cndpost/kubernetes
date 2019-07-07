@@ -1,17 +1,13 @@
 //
 // Copyright (c) 2015 The heketi Authors
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// This file is licensed to you under your choice of the GNU Lesser
+// General Public License, version 3 or any later version (LGPLv3 or
+// later), as published by the Free Software Foundation,
+// or under the Apache License, Version 2.0 <LICENSE-APACHE2 or
+// http://www.apache.org/licenses/LICENSE-2.0>.
 //
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// You may not use this file except in compliance with those terms.
 //
 
 package client
@@ -55,6 +51,7 @@ func (c *Client) VolumeCreate(request *api.VolumeCreateRequest) (
 	if err != nil {
 		return nil, err
 	}
+	defer r.Body.Close()
 	if r.StatusCode != http.StatusAccepted {
 		return nil, utils.GetErrorFromResponse(r)
 	}
@@ -71,7 +68,60 @@ func (c *Client) VolumeCreate(request *api.VolumeCreateRequest) (
 	// Read JSON response
 	var volume api.VolumeInfoResponse
 	err = utils.GetJsonFromResponse(r, &volume)
-	r.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+
+	return &volume, nil
+
+}
+
+func (c *Client) VolumeSetBlockRestriction(id string, request *api.VolumeBlockRestrictionRequest) (
+	*api.VolumeInfoResponse, error) {
+
+	// Marshal request to JSON
+	buffer, err := json.Marshal(request)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create a request
+	req, err := http.NewRequest("POST",
+		c.host+"/volumes/"+id+"/block-restriction",
+		bytes.NewBuffer(buffer))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	// Set token
+	err = c.setToken(req)
+	if err != nil {
+		return nil, err
+	}
+
+	// Send request
+	r, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusAccepted {
+		return nil, utils.GetErrorFromResponse(r)
+	}
+
+	// Wait for response
+	r, err = c.waitForResponseWithTimer(r, time.Second)
+	if err != nil {
+		return nil, err
+	}
+	if r.StatusCode != http.StatusOK {
+		return nil, utils.GetErrorFromResponse(r)
+	}
+
+	// Read JSON response
+	var volume api.VolumeInfoResponse
+	err = utils.GetJsonFromResponse(r, &volume)
 	if err != nil {
 		return nil, err
 	}
@@ -109,6 +159,7 @@ func (c *Client) VolumeExpand(id string, request *api.VolumeExpandRequest) (
 	if err != nil {
 		return nil, err
 	}
+	defer r.Body.Close()
 	if r.StatusCode != http.StatusAccepted {
 		return nil, utils.GetErrorFromResponse(r)
 	}
@@ -125,7 +176,6 @@ func (c *Client) VolumeExpand(id string, request *api.VolumeExpandRequest) (
 	// Read JSON response
 	var volume api.VolumeInfoResponse
 	err = utils.GetJsonFromResponse(r, &volume)
-	r.Body.Close()
 	if err != nil {
 		return nil, err
 	}
@@ -153,6 +203,7 @@ func (c *Client) VolumeList() (*api.VolumeListResponse, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer r.Body.Close()
 	if r.StatusCode != http.StatusOK {
 		return nil, utils.GetErrorFromResponse(r)
 	}
@@ -186,6 +237,7 @@ func (c *Client) VolumeInfo(id string) (*api.VolumeInfoResponse, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer r.Body.Close()
 	if r.StatusCode != http.StatusOK {
 		return nil, utils.GetErrorFromResponse(r)
 	}
@@ -193,7 +245,6 @@ func (c *Client) VolumeInfo(id string) (*api.VolumeInfoResponse, error) {
 	// Read JSON response
 	var volume api.VolumeInfoResponse
 	err = utils.GetJsonFromResponse(r, &volume)
-	r.Body.Close()
 	if err != nil {
 		return nil, err
 	}
@@ -220,6 +271,7 @@ func (c *Client) VolumeDelete(id string) error {
 	if err != nil {
 		return err
 	}
+	defer r.Body.Close()
 	if r.StatusCode != http.StatusAccepted {
 		return utils.GetErrorFromResponse(r)
 	}
@@ -234,4 +286,53 @@ func (c *Client) VolumeDelete(id string) error {
 	}
 
 	return nil
+}
+
+func (c *Client) VolumeClone(id string, request *api.VolumeCloneRequest) (*api.VolumeInfoResponse, error) {
+	// Marshal request to JSON
+	buffer, err := json.Marshal(request)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create a request
+	req, err := http.NewRequest("POST", c.host+"/volumes/"+id+"/clone", bytes.NewBuffer(buffer))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	// Set token
+	err = c.setToken(req)
+	if err != nil {
+		return nil, err
+	}
+
+	// Send request
+	r, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusAccepted {
+		return nil, utils.GetErrorFromResponse(r)
+	}
+
+	// Wait for response
+	r, err = c.waitForResponseWithTimer(r, time.Second)
+	if err != nil {
+		return nil, err
+	}
+	if r.StatusCode != http.StatusOK {
+		return nil, utils.GetErrorFromResponse(r)
+	}
+
+	// Read JSON response
+	var volume api.VolumeInfoResponse
+	err = utils.GetJsonFromResponse(r, &volume)
+	if err != nil {
+		return nil, err
+	}
+
+	return &volume, nil
 }

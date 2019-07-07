@@ -1,11 +1,4 @@
-package(default_visibility = ["//visibility:public"])
-
-licenses(["notice"])
-
-load(
-    "@io_bazel_rules_go//go:def.bzl",
-    "go_library",
-)
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "go_default_library",
@@ -22,12 +15,14 @@ go_library(
         "doc.go",
         "entity_accessors.go",
         "filter.go",
+        "json.go",
         "jsr311.go",
         "logger.go",
         "mime.go",
         "options_filter.go",
         "parameter.go",
         "path_expression.go",
+        "path_processor.go",
         "request.go",
         "response.go",
         "route.go",
@@ -37,7 +32,9 @@ go_library(
         "web_service.go",
         "web_service_container.go",
     ],
-    tags = ["automanaged"],
+    importmap = "k8s.io/kubernetes/vendor/github.com/emicklei/go-restful",
+    importpath = "github.com/emicklei/go-restful",
+    visibility = ["//visibility:public"],
     deps = ["//vendor/github.com/emicklei/go-restful/log:go_default_library"],
 )
 
@@ -53,7 +50,7 @@ filegroup(
     srcs = [
         ":package-srcs",
         "//vendor/github.com/emicklei/go-restful/log:all-srcs",
-        "//vendor/github.com/emicklei/go-restful/swagger:all-srcs",
     ],
     tags = ["automanaged"],
+    visibility = ["//visibility:public"],
 )

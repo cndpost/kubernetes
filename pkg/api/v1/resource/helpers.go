@@ -21,59 +21,54 @@ import (
 	"math"
 	"strconv"
 
+	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/kubernetes/pkg/api/v1"
 )
 
-// PodRequestsAndLimits returns a dictionary of all defined resources summed up for all
-// containers of the pod.
-func PodRequestsAndLimits(pod *v1.Pod) (reqs map[v1.ResourceName]resource.Quantity, limits map[v1.ResourceName]resource.Quantity, err error) {
-	reqs, limits = map[v1.ResourceName]resource.Quantity{}, map[v1.ResourceName]resource.Quantity{}
-	for _, container := range pod.Spec.Containers {
-		for name, quantity := range container.Resources.Requests {
-			if value, ok := reqs[name]; !ok {
-				reqs[name] = *quantity.Copy()
-			} else {
-				value.Add(quantity)
-				reqs[name] = value
-			}
+// addResourceList adds the resources in newList to list
+func addResourceList(list, new v1.ResourceList) {
+	for name, quantity := range new {
+		if value, ok := list[name]; !ok {
+			list[name] = *quantity.Copy()
+		} else {
+			value.Add(quantity)
+			list[name] = value
 		}
-		for name, quantity := range container.Resources.Limits {
-			if value, ok := limits[name]; !ok {
-				limits[name] = *quantity.Copy()
-			} else {
-				value.Add(quantity)
-				limits[name] = value
+	}
+}
+
+// maxResourceList sets list to the greater of list/newList for every resource
+// either list
+func maxResourceList(list, new v1.ResourceList) {
+	for name, quantity := range new {
+		if value, ok := list[name]; !ok {
+			list[name] = *quantity.Copy()
+			continue
+		} else {
+			if quantity.Cmp(value) > 0 {
+				list[name] = *quantity.Copy()
 			}
 		}
 	}
+}
+
+// PodRequestsAndLimits returns a dictionary of all defined resources summed up for all
+// containers of the pod.
+func PodRequestsAndLimits(pod *v1.Pod) (reqs, limits v1.ResourceList) {
+	reqs, limits = v1.ResourceList{}, v1.ResourceList{}
+	for _, container := range pod.Spec.Containers {
+		addResourceList(reqs, container.Resources.Requests)
+		addResourceList(limits, container.Resources.Limits)
+	}
 	// init containers define the minimum of any resource
 	for _, container := range pod.Spec.InitContainers {
-		for name, quantity := range container.Resources.Requests {
-			value, ok := reqs[name]
-			if !ok {
-				reqs[name] = *quantity.Copy()
-				continue
-			}
-			if quantity.Cmp(value) > 0 {
-				reqs[name] = *quantity.Copy()
-			}
-		}
-		for name, quantity := range container.Resources.Limits {
-			value, ok := limits[name]
-			if !ok {
-				limits[name] = *quantity.Copy()
-				continue
-			}
-			if quantity.Cmp(value) > 0 {
-				limits[name] = *quantity.Copy()
-			}
-		}
+		maxResourceList(reqs, container.Resources.Requests)
+		maxResourceList(limits, container.Resources.Limits)
 	}
 	return
 }
 
-// finds and returns the request for a specific resource.
+// GetResourceRequest finds and returns the request for a specific resource.
 func GetResourceRequest(pod *v1.Pod, resource v1.ResourceName) int64 {
 	if resource == v1.ResourcePods {
 		return 1
@@ -91,8 +86,10 @@ func GetResourceRequest(pod *v1.Pod, resource v1.ResourceName) int64 {
 	// take max_resource(sum_pod, any_init_container)
 	for _, container := range pod.Spec.InitContainers {
 		if rQuantity, ok := container.Resources.Requests[resource]; ok {
-			if resource == v1.ResourceCPU && rQuantity.MilliValue() > totalResources {
-				totalResources = rQuantity.MilliValue()
+			if resource == v1.ResourceCPU {
+				if rQuantity.MilliValue() > totalResources {
+					totalResources = rQuantity.MilliValue()
+				}
 			} else if rQuantity.Value() > totalResources {
 				totalResources = rQuantity.Value()
 			}
@@ -111,27 +108,15 @@ func ExtractResourceValueByContainerName(fs *v1.ResourceFieldSelector, pod *v1.P
 	return ExtractContainerResourceValue(fs, container)
 }
 
-type deepCopier interface {
-	DeepCopy(interface{}) (interface{}, error)
-}
-
 // ExtractResourceValueByContainerNameAndNodeAllocatable extracts the value of a resource
 // by providing container name and node allocatable
-func ExtractResourceValueByContainerNameAndNodeAllocatable(copier deepCopier, fs *v1.ResourceFieldSelector, pod *v1.Pod, containerName string, nodeAllocatable v1.ResourceList) (string, error) {
+func ExtractResourceValueByContainerNameAndNodeAllocatable(fs *v1.ResourceFieldSelector, pod *v1.Pod, containerName string, nodeAllocatable v1.ResourceList) (string, error) {
 	realContainer, err := findContainerInPod(pod, containerName)
 	if err != nil {
 		return "", err
 	}
 
-	containerCopy, err := copier.DeepCopy(realContainer)
-	if err != nil {
-		return "", fmt.Errorf("failed to perform a deep copy of container object: %v", err)
-	}
-
-	container, ok := containerCopy.(*v1.Container)
-	if !ok {
-		return "", fmt.Errorf("unexpected type returned from deep copy of container object")
-	}
+	container := realContainer.DeepCopy()
 
 	MergeContainerResourceLimits(container, nodeAllocatable)
 
@@ -153,10 +138,14 @@ func ExtractContainerResourceValue(fs *v1.ResourceFieldSelector, container *v1.C
 		return convertResourceCPUToString(container.Resources.Limits.Cpu(), divisor)
 	case "limits.memory":
 		return convertResourceMemoryToString(container.Resources.Limits.Memory(), divisor)
+	case "limits.ephemeral-storage":
+		return convertResourceEphemeralStorageToString(container.Resources.Limits.StorageEphemeral(), divisor)
 	case "requests.cpu":
 		return convertResourceCPUToString(container.Resources.Requests.Cpu(), divisor)
 	case "requests.memory":
 		return convertResourceMemoryToString(container.Resources.Requests.Memory(), divisor)
+	case "requests.ephemeral-storage":
+		return convertResourceEphemeralStorageToString(container.Resources.Requests.StorageEphemeral(), divisor)
 	}
 
 	return "", fmt.Errorf("Unsupported container resource : %v", fs.Resource)
@@ -176,9 +165,21 @@ func convertResourceMemoryToString(memory *resource.Quantity, divisor resource.Q
 	return strconv.FormatInt(m, 10), nil
 }
 
+// convertResourceEphemeralStorageToString converts ephemeral storage value to the format of divisor and returns
+// ceiling of the value.
+func convertResourceEphemeralStorageToString(ephemeralStorage *resource.Quantity, divisor resource.Quantity) (string, error) {
+	m := int64(math.Ceil(float64(ephemeralStorage.Value()) / float64(divisor.Value())))
+	return strconv.FormatInt(m, 10), nil
+}
+
 // findContainerInPod finds a container by its name in the provided pod
 func findContainerInPod(pod *v1.Pod, containerName string) (*v1.Container, error) {
 	for _, container := range pod.Spec.Containers {
+		if container.Name == containerName {
+			return &container, nil
+		}
+	}
+	for _, container := range pod.Spec.InitContainers {
 		if container.Name == containerName {
 			return &container, nil
 		}
@@ -193,7 +194,7 @@ func MergeContainerResourceLimits(container *v1.Container,
 	if container.Resources.Limits == nil {
 		container.Resources.Limits = make(v1.ResourceList)
 	}
-	for _, resource := range []v1.ResourceName{v1.ResourceCPU, v1.ResourceMemory} {
+	for _, resource := range []v1.ResourceName{v1.ResourceCPU, v1.ResourceMemory, v1.ResourceEphemeralStorage} {
 		if quantity, exists := container.Resources.Limits[resource]; !exists || quantity.IsZero() {
 			if cap, exists := allocatable[resource]; exists {
 				container.Resources.Limits[resource] = *cap.Copy()

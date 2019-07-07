@@ -19,7 +19,7 @@ limitations under the License.
 package selinux
 
 import (
-	"github.com/opencontainers/runc/libcontainer/selinux"
+	selinux "github.com/opencontainers/selinux/go-selinux"
 )
 
 // SELinuxEnabled returns whether SELinux is enabled on the system.  SELinux
@@ -35,7 +35,7 @@ import (
 // SELinuxEnabled returns true if SELinux is enforcing or permissive, and
 // false if it is disabled.
 func SELinuxEnabled() bool {
-	return selinux.SelinuxEnabled()
+	return selinux.GetEnabled()
 }
 
 // realSELinuxRunner is the real implementation of SELinuxRunner interface for
@@ -48,5 +48,10 @@ func (_ *realSELinuxRunner) Getfilecon(path string) (string, error) {
 	if !SELinuxEnabled() {
 		return "", nil
 	}
-	return selinux.Getfilecon(path)
+	return selinux.FileLabel(path)
+}
+
+// SetFileLabel applies the SELinux label on the path or returns an error.
+func SetFileLabel(path string, label string) error {
+	return selinux.SetFileLabel(path, label)
 }

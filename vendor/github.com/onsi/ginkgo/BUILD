@@ -1,16 +1,11 @@
-package(default_visibility = ["//visibility:public"])
-
-licenses(["notice"])
-
-load(
-    "@io_bazel_rules_go//go:def.bzl",
-    "go_library",
-)
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "go_default_library",
     srcs = ["ginkgo_dsl.go"],
-    tags = ["automanaged"],
+    importmap = "k8s.io/kubernetes/vendor/github.com/onsi/ginkgo",
+    importpath = "github.com/onsi/ginkgo",
+    visibility = ["//visibility:public"],
     deps = [
         "//vendor/github.com/onsi/ginkgo/config:go_default_library",
         "//vendor/github.com/onsi/ginkgo/internal/codelocation:go_default_library",
@@ -21,6 +16,7 @@ go_library(
         "//vendor/github.com/onsi/ginkgo/internal/writer:go_default_library",
         "//vendor/github.com/onsi/ginkgo/reporters:go_default_library",
         "//vendor/github.com/onsi/ginkgo/reporters/stenographer:go_default_library",
+        "//vendor/github.com/onsi/ginkgo/reporters/stenographer/support/go-colorable:go_default_library",
         "//vendor/github.com/onsi/ginkgo/types:go_default_library",
     ],
 )
@@ -53,4 +49,5 @@ filegroup(
         "//vendor/github.com/onsi/ginkgo/types:all-srcs",
     ],
     tags = ["automanaged"],
+    visibility = ["//visibility:public"],
 )

@@ -16,20 +16,25 @@ go_test(
         "preallocate_test.go",
         "purge_test.go",
     ],
-    library = ":go_default_library",
-    tags = ["automanaged"],
+    embed = [":go_default_library"],
 )
 
 go_library(
     name = "go_default_library",
     srcs = [
         "fileutil.go",
+        "lock_plan9.go",
+        "lock_solaris.go",
         "lock_unix.go",
+        "lock_windows.go",
+        "perallocate_unsupported.go",
         "preallocate.go",
         "purge.go",
     ],
-    tags = ["automanaged"],
-    deps = ["//vendor/github.com/coreos/pkg/capnslog:go_default_library"],
+    importpath = "k8s.io/kubernetes/third_party/forked/etcd221/pkg/fileutil",
+    deps = [
+        "//vendor/github.com/coreos/pkg/capnslog:go_default_library",
+    ],
 )
 
 filegroup(

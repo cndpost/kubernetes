@@ -19,12 +19,13 @@ package main
 import (
 	"os"
 
+	"k8s.io/klog"
 	"k8s.io/kubernetes/cmd/kubeadm/app"
 )
 
 func main() {
+	klog.InitFlags(nil)
 	if err := app.Run(); err != nil {
 		os.Exit(1)
 	}
-	os.Exit(0)
 }

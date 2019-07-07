@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Copyright 2015 The Kubernetes Authors.
 #
@@ -21,10 +21,11 @@ set -o nounset
 set -o pipefail
 
 KUBE_HOST=${KUBE_HOST:-localhost}
+KUBELET_KUBECONFIG=${KUBELET_KUBECONFIG:-"/var/run/kubernetes/kubelet.kubeconfig"}
 
-declare -r RED="\033[0;31m"
-declare -r GREEN="\033[0;32m"
-declare -r YELLOW="\033[0;33m"
+declare -r RED="\\033[0;31m"
+declare -r GREEN="\\033[0;32m"
+declare -r YELLOW="\\033[0;33m"
 
 function echo_green {
   echo -e "${GREEN}$1"; tput sgr0
@@ -48,39 +49,72 @@ function run {
     echo_green "SUCCESS"
   else
     echo_red "FAILED"
-    echo $output >&2
+    echo "${output}" >&2
     exit 1
   fi
 }
 
+# Creates a kubeconfig file for the kubelet.
+# Args: the IP address of the API server (e.g. "http://localhost:8080"), destination file path
+function create-kubelet-kubeconfig() {
+  #local api_addr="${1}"
+  local destination dest_dir
+  destination="${2}"
+  if [[ -z "${destination}" ]]; then
+    echo "Must provide destination path to create Kubelet kubeconfig file!"
+    exit 1
+  fi
+  echo "Creating Kubelet kubeconfig file"
+  dest_dir="$(dirname "${destination}")"
+  mkdir -p "${dest_dir}" &>/dev/null || sudo mkdir -p "${dest_dir}"
+  sudo=$(test -w "${dest_dir}" || echo "sudo -E")
+  cat <<EOF | ${sudo} tee "${destination}" > /dev/null
+apiVersion: v1
+kind: Config
+clusters:
+  - cluster:
+      server: http://localhost:8080
+    name: local
+contexts:
+  - context:
+      cluster: local
+    name: local
+current-context: local
+EOF
+}
+
+
 function create_cluster {
   echo "Creating a local cluster:"
-  echo -e -n "\tStarting kubelet..."
+  echo -e -n "\\tStarting kubelet..."
+  create-kubelet-kubeconfig "http://localhost:8080" "${KUBELET_KUBECONFIG}"
   run "docker run \
   --volume=/:/rootfs:ro \
   --volume=/sys:/sys:ro \
   --volume=/var/lib/docker/:/var/lib/docker:rw \
   --volume=/var/lib/kubelet/:/var/lib/kubelet:rw \
+  --volume=/usr/libexec/kubernetes/kubelet-plugins/volume/exec:/usr/libexec/kubernetes/kubelet-plugins/volume/exec:rw \
   --volume=/var/run:/var/run:rw \
+  --volume=/run/xtables.lock:/run/xtables.lock:rw \
   --net=host \
   --pid=host \
   --privileged=true \
   -d \
-  gcr.io/google_containers/hyperkube-${arch}:${release} \
+  k8s.gcr.io/hyperkube-${arch}:${release} \
     /hyperkube kubelet \
       --containerized \
-      --hostname-override="127.0.0.1" \
-      --address="0.0.0.0" \
-      --api-servers=http://localhost:8080 \
+      --hostname-override=127.0.0.1 \
+      --address=0.0.0.0 \
+      --kubeconfig=${KUBELET_KUBECONFIG} \
       --pod-manifest-path=/etc/kubernetes/manifests \
-      --allow-privileged=true \
       --cluster-dns=10.0.0.10 \
       --cluster-domain=cluster.local \
       --v=2"
 
   echo -e -n "\tWaiting for master components to start..."
   while true; do
-    local running_count=$(kubectl -s=http://${KUBE_HOST}:8080 get pods --no-headers --namespace=kube-system 2>/dev/null | grep "Running" | wc -l)
+    local running_count
+    running_count=$(kubectl "-s=http://${KUBE_HOST}:8080" get pods --no-headers --namespace=kube-system 2>/dev/null | grep -c "Running")
     # We expect to have 3 running pods - etcd, master and kube-proxy.
     if [ "$running_count" -ge 3 ]; then
       break
@@ -91,7 +125,7 @@ function create_cluster {
   echo_green "SUCCESS"
   echo_green "Cluster created!"
   echo ""
-  kubectl -s http://${KUBE_HOST}:8080 clusterinfo
+  kubectl -s "http://${KUBE_HOST}:8080" clusterinfo
 }
 
 function get_latest_version_number {
@@ -139,7 +173,7 @@ fi
 
 kubectl_url="https://storage.googleapis.com/kubernetes-release/release/${release}/bin/${platform}/${arch}/kubectl"
 
-if [[ $(ls . | grep ^kubectl$ | wc -l) -lt 1 ]]; then
+if [[ ! -f ./kubectl ]]; then
   echo -n "Downloading kubectl binary..."
   if [[ $(which wget) ]]; then
     run "wget ${kubectl_url}"
@@ -162,7 +196,7 @@ create_cluster
 echo ""
 echo ""
 echo "To list the nodes in your cluster run"
-echo_yellow "\tkubectl -s=http://${KUBE_HOST}:8080 get nodes"
+echo_yellow "\\tkubectl -s=http://${KUBE_HOST}:8080 get nodes"
 echo ""
 echo "To run your first pod run"
-echo_yellow "\tkubectl -s http://${KUBE_HOST}:8080 run nginx --image=nginx --port=80"
+echo_yellow "\\tkubectl -s http://${KUBE_HOST}:8080 run nginx --image=nginx --port=80"

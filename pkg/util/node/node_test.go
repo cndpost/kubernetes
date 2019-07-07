@@ -19,8 +19,8 @@ package node
 import (
 	"testing"
 
+	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/kubernetes/pkg/api/v1"
 )
 
 func TestGetPreferredAddress(t *testing.T) {
@@ -52,7 +52,7 @@ func TestGetPreferredAddress(t *testing.T) {
 			ExpectAddress: "1.2.3.5",
 		},
 		"found hostname address": {
-			Labels: map[string]string{metav1.LabelHostname: "label-hostname"},
+			Labels: map[string]string{v1.LabelHostname: "label-hostname"},
 			Addresses: []v1.NodeAddress{
 				{Type: v1.NodeExternalIP, Address: "1.2.3.5"},
 				{Type: v1.NodeHostName, Address: "status-hostname"},
@@ -60,13 +60,13 @@ func TestGetPreferredAddress(t *testing.T) {
 			Preferences:   []v1.NodeAddressType{v1.NodeHostName, v1.NodeExternalIP},
 			ExpectAddress: "status-hostname",
 		},
-		"found label address": {
-			Labels: map[string]string{metav1.LabelHostname: "label-hostname"},
+		"label address ignored": {
+			Labels: map[string]string{v1.LabelHostname: "label-hostname"},
 			Addresses: []v1.NodeAddress{
 				{Type: v1.NodeExternalIP, Address: "1.2.3.5"},
 			},
 			Preferences:   []v1.NodeAddressType{v1.NodeHostName, v1.NodeExternalIP},
-			ExpectAddress: "label-hostname",
+			ExpectAddress: "1.2.3.5",
 		},
 	}
 
@@ -86,5 +86,37 @@ func TestGetPreferredAddress(t *testing.T) {
 		if address != tc.ExpectAddress {
 			t.Errorf("%s: expected address=%q, got %q", k, tc.ExpectAddress, address)
 		}
+	}
+}
+
+func TestGetHostname(t *testing.T) {
+	testCases := []struct {
+		hostName         string
+		expectedHostName string
+		expectError      bool
+	}{
+		{
+			hostName:    "   ",
+			expectError: true,
+		},
+		{
+			hostName:         " abc  ",
+			expectedHostName: "abc",
+			expectError:      false,
+		},
+	}
+
+	for idx, test := range testCases {
+		hostName, err := GetHostname(test.hostName)
+		if err != nil && !test.expectError {
+			t.Errorf("[%d]: unexpected error: %s", idx, err)
+		}
+		if err == nil && test.expectError {
+			t.Errorf("[%d]: expected error, got none", idx)
+		}
+		if test.expectedHostName != hostName {
+			t.Errorf("[%d]: expected output %q, got %q", idx, test.expectedHostName, hostName)
+		}
+
 	}
 }

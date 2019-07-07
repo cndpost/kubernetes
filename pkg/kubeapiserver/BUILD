@@ -1,11 +1,8 @@
 package(default_visibility = ["//visibility:public"])
 
-licenses(["notice"])
-
 load(
     "@io_bazel_rules_go//go:def.bzl",
     "go_library",
-    "go_test",
 )
 
 go_library(
@@ -14,14 +11,26 @@ go_library(
         "default_storage_factory_builder.go",
         "doc.go",
     ],
-    tags = ["automanaged"],
+    importpath = "k8s.io/kubernetes/pkg/kubeapiserver",
     deps = [
-        "//pkg/api:go_default_library",
-        "//vendor/k8s.io/apimachinery/pkg/runtime:go_default_library",
-        "//vendor/k8s.io/apimachinery/pkg/runtime/schema:go_default_library",
-        "//vendor/k8s.io/apiserver/pkg/server/storage:go_default_library",
-        "//vendor/k8s.io/apiserver/pkg/storage/storagebackend:go_default_library",
-        "//vendor/k8s.io/apiserver/pkg/util/flag:go_default_library",
+        "//pkg/api/legacyscheme:go_default_library",
+        "//pkg/apis/apps:go_default_library",
+        "//pkg/apis/batch:go_default_library",
+        "//pkg/apis/core:go_default_library",
+        "//pkg/apis/events:go_default_library",
+        "//pkg/apis/extensions:go_default_library",
+        "//pkg/apis/networking:go_default_library",
+        "//pkg/apis/policy:go_default_library",
+        "//pkg/apis/storage:go_default_library",
+        "//pkg/features:go_default_library",
+        "//staging/src/k8s.io/apimachinery/pkg/runtime:go_default_library",
+        "//staging/src/k8s.io/apimachinery/pkg/runtime/schema:go_default_library",
+        "//staging/src/k8s.io/apiserver/pkg/server/options:go_default_library",
+        "//staging/src/k8s.io/apiserver/pkg/server/options/encryptionconfig:go_default_library",
+        "//staging/src/k8s.io/apiserver/pkg/server/resourceconfig:go_default_library",
+        "//staging/src/k8s.io/apiserver/pkg/server/storage:go_default_library",
+        "//staging/src/k8s.io/apiserver/pkg/storage/storagebackend:go_default_library",
+        "//staging/src/k8s.io/apiserver/pkg/util/feature:go_default_library",
     ],
 )
 
@@ -43,20 +52,4 @@ filegroup(
         "//pkg/kubeapiserver/server:all-srcs",
     ],
     tags = ["automanaged"],
-)
-
-go_test(
-    name = "go_default_test",
-    srcs = ["default_storage_factory_builder_test.go"],
-    library = ":go_default_library",
-    tags = ["automanaged"],
-    deps = [
-        "//pkg/api:go_default_library",
-        "//pkg/api/install:go_default_library",
-        "//pkg/api/v1:go_default_library",
-        "//pkg/apis/extensions/install:go_default_library",
-        "//pkg/apis/extensions/v1beta1:go_default_library",
-        "//vendor/k8s.io/apimachinery/pkg/runtime/schema:go_default_library",
-        "//vendor/k8s.io/apiserver/pkg/server/storage:go_default_library",
-    ],
 )

@@ -21,7 +21,7 @@ import (
 	"os"
 	"testing"
 
-	"k8s.io/kubernetes/pkg/api/v1"
+	"k8s.io/api/core/v1"
 	"k8s.io/kubernetes/pkg/volume"
 	volumetest "k8s.io/kubernetes/pkg/volume/testing"
 
@@ -34,7 +34,7 @@ func TestFlockerUtil_CreateVolume(t *testing.T) {
 	// test CreateVolume happy path
 	pvc := volumetest.CreateTestPVC("3Gi", []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce})
 	options := volume.VolumeOptions{
-		PVC: pvc,
+		PVC:                           pvc,
 		PersistentVolumeReclaimPolicy: v1.PersistentVolumeReclaimDelete,
 	}
 
@@ -44,7 +44,7 @@ func TestFlockerUtil_CreateVolume(t *testing.T) {
 	defer os.RemoveAll(dir)
 	provisioner.flockerClient = fakeFlockerClient
 
-	flockerUtil := &FlockerUtil{}
+	flockerUtil := &flockerUtil{}
 
 	datasetID, size, _, err := flockerUtil.CreateVolume(provisioner)
 	assert.NoError(err)

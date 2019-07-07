@@ -19,6 +19,7 @@ package statefulset
 import (
 	"fmt"
 	"math/rand"
+	"reflect"
 	"sort"
 	"strconv"
 	"testing"
@@ -28,10 +29,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
-	"k8s.io/kubernetes/pkg/api/v1"
+	apps "k8s.io/api/apps/v1"
+	"k8s.io/api/core/v1"
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
-	apps "k8s.io/kubernetes/pkg/apis/apps/v1beta1"
-	"k8s.io/kubernetes/pkg/controller"
+	"k8s.io/kubernetes/pkg/controller/history"
 )
 
 func TestGetParentNameAndOrdinal(t *testing.T) {
@@ -79,14 +80,9 @@ func TestIdentityMatches(t *testing.T) {
 		t.Error("identity matches for a Pod with the wrong namespace")
 	}
 	pod = newStatefulSetPod(set, 1)
-	pod.Spec.Hostname = ""
+	delete(pod.Labels, apps.StatefulSetPodNameLabel)
 	if identityMatches(set, pod) {
-		t.Error("identity matches for a Pod with no hostname")
-	}
-	pod = newStatefulSetPod(set, 1)
-	pod.Spec.Subdomain = ""
-	if identityMatches(set, pod) {
-		t.Error("identity matches for a Pod with no subdomain")
+		t.Error("identity matches for a Pod with the wrong statefulSetPodNameLabel")
 	}
 }
 
@@ -137,23 +133,10 @@ func TestUpdateIdentity(t *testing.T) {
 	if !identityMatches(set, pod) {
 		t.Error("updateIdentity failed to update the Pods namespace")
 	}
-	pod = newStatefulSetPod(set, 1)
-	pod.Spec.Hostname = ""
-	if identityMatches(set, pod) {
-		t.Error("identity matches for a Pod with no hostname")
-	}
+	delete(pod.Labels, apps.StatefulSetPodNameLabel)
 	updateIdentity(set, pod)
 	if !identityMatches(set, pod) {
-		t.Error("updateIdentity failed to update the Pod's hostname")
-	}
-	pod = newStatefulSetPod(set, 1)
-	pod.Spec.Subdomain = ""
-	if identityMatches(set, pod) {
-		t.Error("identity matches for a Pod with no subdomain")
-	}
-	updateIdentity(set, pod)
-	if !identityMatches(set, pod) {
-		t.Error("updateIdentity failed to update the Pod's subdomain")
+		t.Error("updateIdentity failed to restore the statefulSetPodName label")
 	}
 }
 
@@ -212,25 +195,10 @@ func TestIsRunningAndReady(t *testing.T) {
 	if !isRunningAndReady(pod) {
 		t.Error("Pod should be running and ready")
 	}
-	pod.Annotations[apps.StatefulSetInitAnnotation] = "true"
-	if !isRunningAndReady(pod) {
-		t.Error("isRunningAndReady does not respected init annotation set to true")
-	}
-	pod.Annotations[apps.StatefulSetInitAnnotation] = "false"
-	if isRunningAndReady(pod) {
-		t.Error("isRunningAndReady does not respected init annotation set to false")
-	}
-	pod.Annotations[apps.StatefulSetInitAnnotation] = "blah"
-	if !isRunningAndReady(pod) {
-		t.Error("isRunningAndReady does not erroneous init annotation")
-	}
 }
 
 func TestAscendingOrdinal(t *testing.T) {
 	set := newStatefulSet(10)
-	for i := 0; i < 10; i++ {
-
-	}
 	pods := make([]*v1.Pod, 10)
 	perm := rand.Perm(10)
 	for i, v := range perm {
@@ -266,7 +234,7 @@ func TestOverlappingStatefulSets(t *testing.T) {
 func TestNewPodControllerRef(t *testing.T) {
 	set := newStatefulSet(1)
 	pod := newStatefulSetPod(set, 0)
-	controllerRef := controller.GetControllerOf(pod)
+	controllerRef := metav1.GetControllerOf(pod)
 	if controllerRef == nil {
 		t.Fatalf("No ControllerRef found on new pod")
 	}
@@ -284,6 +252,135 @@ func TestNewPodControllerRef(t *testing.T) {
 	}
 	if got, want := *controllerRef.Controller, true; got != want {
 		t.Errorf("controllerRef.Controller = %v, want %v", got, want)
+	}
+}
+
+func TestCreateApplyRevision(t *testing.T) {
+	set := newStatefulSet(1)
+	set.Status.CollisionCount = new(int32)
+	revision, err := newRevision(set, 1, set.Status.CollisionCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	set.Spec.Template.Spec.Containers[0].Name = "foo"
+	if set.Annotations == nil {
+		set.Annotations = make(map[string]string)
+	}
+	key := "foo"
+	expectedValue := "bar"
+	set.Annotations[key] = expectedValue
+	restoredSet, err := ApplyRevision(set, revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restoredRevision, err := newRevision(restoredSet, 2, restoredSet.Status.CollisionCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !history.EqualRevision(revision, restoredRevision) {
+		t.Errorf("wanted %v got %v", string(revision.Data.Raw), string(restoredRevision.Data.Raw))
+	}
+	value, ok := restoredRevision.Annotations[key]
+	if !ok {
+		t.Errorf("missing annotation %s", key)
+	}
+	if value != expectedValue {
+		t.Errorf("for annotation %s wanted %s got %s", key, expectedValue, value)
+	}
+}
+
+func TestRollingUpdateApplyRevision(t *testing.T) {
+	set := newStatefulSet(1)
+	set.Status.CollisionCount = new(int32)
+	currentSet := set.DeepCopy()
+	currentRevision, err := newRevision(set, 1, set.Status.CollisionCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	set.Spec.Template.Spec.Containers[0].Env = []v1.EnvVar{{Name: "foo", Value: "bar"}}
+	updateSet := set.DeepCopy()
+	updateRevision, err := newRevision(set, 2, set.Status.CollisionCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	restoredCurrentSet, err := ApplyRevision(set, currentRevision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(currentSet.Spec.Template, restoredCurrentSet.Spec.Template) {
+		t.Errorf("want %v got %v", currentSet.Spec.Template, restoredCurrentSet.Spec.Template)
+	}
+
+	restoredUpdateSet, err := ApplyRevision(set, updateRevision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(updateSet.Spec.Template, restoredUpdateSet.Spec.Template) {
+		t.Errorf("want %v got %v", updateSet.Spec.Template, restoredUpdateSet.Spec.Template)
+	}
+}
+
+func TestGetPersistentVolumeClaims(t *testing.T) {
+
+	// nil inherits statefulset labels
+	pod := newPod()
+	statefulSet := newStatefulSet(1)
+	statefulSet.Spec.Selector.MatchLabels = nil
+	claims := getPersistentVolumeClaims(statefulSet, pod)
+	pvc := newPVC("datadir-foo-0")
+	pvc.SetNamespace(v1.NamespaceDefault)
+	resultClaims := map[string]v1.PersistentVolumeClaim{"datadir": pvc}
+
+	if !reflect.DeepEqual(claims, resultClaims) {
+		t.Fatalf("Unexpected pvc:\n %+v\n, desired pvc:\n %+v", claims, resultClaims)
+	}
+
+	// nil inherits statefulset labels
+	statefulSet.Spec.Selector.MatchLabels = map[string]string{"test": "test"}
+	claims = getPersistentVolumeClaims(statefulSet, pod)
+	pvc.SetLabels(map[string]string{"test": "test"})
+	resultClaims = map[string]v1.PersistentVolumeClaim{"datadir": pvc}
+	if !reflect.DeepEqual(claims, resultClaims) {
+		t.Fatalf("Unexpected pvc:\n %+v\n, desired pvc:\n %+v", claims, resultClaims)
+	}
+
+	// non-nil with non-overlapping labels merge pvc and statefulset labels
+	statefulSet.Spec.Selector.MatchLabels = map[string]string{"name": "foo"}
+	statefulSet.Spec.VolumeClaimTemplates[0].ObjectMeta.Labels = map[string]string{"test": "test"}
+	claims = getPersistentVolumeClaims(statefulSet, pod)
+	pvc.SetLabels(map[string]string{"test": "test", "name": "foo"})
+	resultClaims = map[string]v1.PersistentVolumeClaim{"datadir": pvc}
+	if !reflect.DeepEqual(claims, resultClaims) {
+		t.Fatalf("Unexpected pvc:\n %+v\n, desired pvc:\n %+v", claims, resultClaims)
+	}
+
+	// non-nil with overlapping labels merge pvc and statefulset labels and prefer statefulset labels
+	statefulSet.Spec.Selector.MatchLabels = map[string]string{"test": "foo"}
+	statefulSet.Spec.VolumeClaimTemplates[0].ObjectMeta.Labels = map[string]string{"test": "test"}
+	claims = getPersistentVolumeClaims(statefulSet, pod)
+	pvc.SetLabels(map[string]string{"test": "foo"})
+	resultClaims = map[string]v1.PersistentVolumeClaim{"datadir": pvc}
+	if !reflect.DeepEqual(claims, resultClaims) {
+		t.Fatalf("Unexpected pvc:\n %+v\n, desired pvc:\n %+v", claims, resultClaims)
+	}
+}
+
+func newPod() *v1.Pod {
+	return &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "foo-0",
+			Namespace: v1.NamespaceDefault,
+		},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
+				{
+					Name:  "nginx",
+					Image: "nginx",
+				},
+			},
+		},
 	}
 }
 
@@ -339,7 +436,7 @@ func newStatefulSetWithVolumes(replicas int, name string, petMounts []v1.VolumeM
 	return &apps.StatefulSet{
 		TypeMeta: metav1.TypeMeta{
 			Kind:       "StatefulSet",
-			APIVersion: "apps/v1beta1",
+			APIVersion: "apps/v1",
 		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -354,6 +451,11 @@ func newStatefulSetWithVolumes(replicas int, name string, petMounts []v1.VolumeM
 			Template:             template,
 			VolumeClaimTemplates: claims,
 			ServiceName:          "governingsvc",
+			UpdateStrategy:       apps.StatefulSetUpdateStrategy{Type: apps.RollingUpdateStatefulSetStrategyType},
+			RevisionHistoryLimit: func() *int32 {
+				limit := int32(2)
+				return &limit
+			}(),
 		},
 	}
 }

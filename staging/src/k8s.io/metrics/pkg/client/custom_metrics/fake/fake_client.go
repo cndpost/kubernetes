@@ -19,11 +19,11 @@ package fake
 import (
 	"fmt"
 
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/pkg/api"
 	"k8s.io/client-go/testing"
-	"k8s.io/metrics/pkg/apis/custom_metrics/v1alpha1"
+	"k8s.io/metrics/pkg/apis/custom_metrics/v1beta2"
 	cmclient "k8s.io/metrics/pkg/client/custom_metrics"
 )
 
@@ -51,17 +51,28 @@ func (i GetForActionImpl) GetSubresource() string {
 	return i.MetricName
 }
 
-func NewGetForAction(groupKind schema.GroupKind, namespace, name string, metricName string, labelSelector labels.Selector) GetForActionImpl {
-	mapping, err := api.Registry.RESTMapper().RESTMapping(groupKind)
-	if err != nil {
-		panic(fmt.Sprintf("unable to get REST mapping for groupKind %s while building GetFor action: %v", groupKind.String, err))
+func (i GetForActionImpl) DeepCopy() testing.Action {
+	var labelSelector labels.Selector
+	if i.LabelSelector != nil {
+		labelSelector = i.LabelSelector.DeepCopySelector()
 	}
+	return GetForActionImpl{
+		GetAction:     i.GetAction.DeepCopy().(testing.GetAction),
+		MetricName:    i.MetricName,
+		LabelSelector: labelSelector,
+	}
+}
+
+func NewGetForAction(groupKind schema.GroupKind, namespace, name string, metricName string, labelSelector labels.Selector) GetForActionImpl {
+	// the version doesn't matter
+	gvk := groupKind.WithVersion("")
+	gvr, _ := meta.UnsafeGuessKindToResource(gvk)
 	groupResourceForKind := schema.GroupResource{
-		Group:    mapping.GroupVersionKind.Group,
-		Resource: mapping.Resource,
+		Group:    gvr.Group,
+		Resource: gvr.Resource,
 	}
 	resource := schema.GroupResource{
-		Group:    v1alpha1.SchemeGroupVersion.Group,
+		Group:    v1beta2.SchemeGroupVersion.Group,
 		Resource: groupResourceForKind.String(),
 	}
 	return GetForActionImpl{
@@ -72,16 +83,15 @@ func NewGetForAction(groupKind schema.GroupKind, namespace, name string, metricN
 }
 
 func NewRootGetForAction(groupKind schema.GroupKind, name string, metricName string, labelSelector labels.Selector) GetForActionImpl {
-	mapping, err := api.Registry.RESTMapper().RESTMapping(groupKind)
-	if err != nil {
-		panic(fmt.Sprintf("unable to get REST mapping for groupKind %s while building GetFor action: %v", groupKind.String, err))
-	}
+	// the version doesn't matter
+	gvk := groupKind.WithVersion("")
+	gvr, _ := meta.UnsafeGuessKindToResource(gvk)
 	groupResourceForKind := schema.GroupResource{
-		Group:    mapping.GroupVersionKind.Group,
-		Resource: mapping.Resource,
+		Group:    gvr.Group,
+		Resource: gvr.Resource,
 	}
 	resource := schema.GroupResource{
-		Group:    v1alpha1.SchemeGroupVersion.Group,
+		Group:    v1beta2.SchemeGroupVersion.Group,
 		Resource: groupResourceForKind.String(),
 	}
 	return GetForActionImpl{
@@ -113,15 +123,15 @@ type fakeNamespacedMetrics struct {
 	ns   string
 }
 
-func (m *fakeNamespacedMetrics) GetForObject(groupKind schema.GroupKind, name string, metricName string) (*v1alpha1.MetricValue, error) {
+func (m *fakeNamespacedMetrics) GetForObject(groupKind schema.GroupKind, name string, metricName string, metricSelector labels.Selector) (*v1beta2.MetricValue, error) {
 	obj, err := m.Fake.
-		Invokes(NewGetForAction(groupKind, m.ns, name, metricName, nil), &v1alpha1.MetricValueList{})
+		Invokes(NewGetForAction(groupKind, m.ns, name, metricName, nil), &v1beta2.MetricValueList{})
 
 	if obj == nil {
 		return nil, err
 	}
 
-	objList := obj.(*v1alpha1.MetricValueList)
+	objList := obj.(*v1beta2.MetricValueList)
 	if len(objList.Items) != 1 {
 		return nil, fmt.Errorf("the custom metrics API server returned %v results when we asked for exactly one", len(objList.Items))
 	}
@@ -129,30 +139,30 @@ func (m *fakeNamespacedMetrics) GetForObject(groupKind schema.GroupKind, name st
 	return &objList.Items[0], err
 }
 
-func (m *fakeNamespacedMetrics) GetForObjects(groupKind schema.GroupKind, selector labels.Selector, metricName string) (*v1alpha1.MetricValueList, error) {
+func (m *fakeNamespacedMetrics) GetForObjects(groupKind schema.GroupKind, selector labels.Selector, metricName string, metricSelector labels.Selector) (*v1beta2.MetricValueList, error) {
 	obj, err := m.Fake.
-		Invokes(NewGetForAction(groupKind, m.ns, "*", metricName, selector), &v1alpha1.MetricValueList{})
+		Invokes(NewGetForAction(groupKind, m.ns, "*", metricName, selector), &v1beta2.MetricValueList{})
 
 	if obj == nil {
 		return nil, err
 	}
 
-	return obj.(*v1alpha1.MetricValueList), err
+	return obj.(*v1beta2.MetricValueList), err
 }
 
 type fakeRootScopedMetrics struct {
 	Fake *FakeCustomMetricsClient
 }
 
-func (m *fakeRootScopedMetrics) GetForObject(groupKind schema.GroupKind, name string, metricName string) (*v1alpha1.MetricValue, error) {
+func (m *fakeRootScopedMetrics) GetForObject(groupKind schema.GroupKind, name string, metricName string, metricSelector labels.Selector) (*v1beta2.MetricValue, error) {
 	obj, err := m.Fake.
-		Invokes(NewRootGetForAction(groupKind, name, metricName, nil), &v1alpha1.MetricValueList{})
+		Invokes(NewRootGetForAction(groupKind, name, metricName, nil), &v1beta2.MetricValueList{})
 
 	if obj == nil {
 		return nil, err
 	}
 
-	objList := obj.(*v1alpha1.MetricValueList)
+	objList := obj.(*v1beta2.MetricValueList)
 	if len(objList.Items) != 1 {
 		return nil, fmt.Errorf("the custom metrics API server returned %v results when we asked for exactly one", len(objList.Items))
 	}
@@ -160,13 +170,13 @@ func (m *fakeRootScopedMetrics) GetForObject(groupKind schema.GroupKind, name st
 	return &objList.Items[0], err
 }
 
-func (m *fakeRootScopedMetrics) GetForObjects(groupKind schema.GroupKind, selector labels.Selector, metricName string) (*v1alpha1.MetricValueList, error) {
+func (m *fakeRootScopedMetrics) GetForObjects(groupKind schema.GroupKind, selector labels.Selector, metricName string, metricSelector labels.Selector) (*v1beta2.MetricValueList, error) {
 	obj, err := m.Fake.
-		Invokes(NewRootGetForAction(groupKind, "*", metricName, selector), &v1alpha1.MetricValueList{})
+		Invokes(NewRootGetForAction(groupKind, "*", metricName, selector), &v1beta2.MetricValueList{})
 
 	if obj == nil {
 		return nil, err
 	}
 
-	return obj.(*v1alpha1.MetricValueList), err
+	return obj.(*v1beta2.MetricValueList), err
 }

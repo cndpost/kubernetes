@@ -21,24 +21,31 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"fmt"
+	"strings"
 
+	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/helper"
-	"k8s.io/kubernetes/pkg/api/v1"
-	"k8s.io/kubernetes/pkg/api/validation"
+	api "k8s.io/kubernetes/pkg/apis/core"
+	"k8s.io/kubernetes/pkg/apis/core/helper"
+	// TODO: remove this import if
+	// api.Registry.GroupOrDie(v1.GroupName).GroupVersion.String() is changed
+	// to "v1"?
+	"k8s.io/kubernetes/pkg/api/legacyscheme"
+	_ "k8s.io/kubernetes/pkg/apis/core/install"
+	k8s_api_v1 "k8s.io/kubernetes/pkg/apis/core/v1"
+	"k8s.io/kubernetes/pkg/apis/core/validation"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
 	"k8s.io/kubernetes/pkg/util/hash"
 
-	"github.com/golang/glog"
+	"k8s.io/klog"
 )
 
 // Generate a pod name that is unique among nodes by appending the nodeName.
 func generatePodName(name string, nodeName types.NodeName) string {
-	return fmt.Sprintf("%s-%s", name, nodeName)
+	return fmt.Sprintf("%s-%s", name, strings.ToLower(string(nodeName)))
 }
 
 func applyDefaults(pod *api.Pod, source string, isFile bool, nodeName types.NodeName) error {
@@ -52,16 +59,16 @@ func applyDefaults(pod *api.Pod, source string, isFile bool, nodeName types.Node
 		}
 		hash.DeepHashObject(hasher, pod)
 		pod.UID = types.UID(hex.EncodeToString(hasher.Sum(nil)[0:]))
-		glog.V(5).Infof("Generated UID %q pod %q from %s", pod.UID, pod.Name, source)
+		klog.V(5).Infof("Generated UID %q pod %q from %s", pod.UID, pod.Name, source)
 	}
 
 	pod.Name = generatePodName(pod.Name, nodeName)
-	glog.V(5).Infof("Generated Name %q for UID %q from URL %s", pod.Name, pod.UID, source)
+	klog.V(5).Infof("Generated Name %q for UID %q from URL %s", pod.Name, pod.UID, source)
 
 	if pod.Namespace == "" {
 		pod.Namespace = metav1.NamespaceDefault
 	}
-	glog.V(5).Infof("Using namespace %q for pod %q from %s", pod.Namespace, pod.Name, source)
+	klog.V(5).Infof("Using namespace %q for pod %q from %s", pod.Namespace, pod.Name, source)
 
 	// Set the Host field to indicate this pod is scheduled on the current node.
 	pod.Spec.NodeName = string(nodeName)
@@ -93,7 +100,7 @@ func getSelfLink(name, namespace string) string {
 	if len(namespace) == 0 {
 		namespace = metav1.NamespaceDefault
 	}
-	selfLink = fmt.Sprintf("/api/"+api.Registry.GroupOrDie(api.GroupName).GroupVersion.Version+"/pods/namespaces/%s/%s", name, namespace)
+	selfLink = fmt.Sprintf("/api/v1/namespaces/%s/pods/%s", namespace, name)
 	return selfLink
 }
 
@@ -105,42 +112,45 @@ func tryDecodeSinglePod(data []byte, defaultFn defaultFunc) (parsed bool, pod *v
 	if err != nil {
 		return false, nil, err
 	}
-	obj, err := runtime.Decode(api.Codecs.UniversalDecoder(), json)
+	obj, err := runtime.Decode(legacyscheme.Codecs.UniversalDecoder(), json)
 	if err != nil {
 		return false, pod, err
 	}
+
+	newPod, ok := obj.(*api.Pod)
 	// Check whether the object could be converted to single pod.
-	if _, ok := obj.(*api.Pod); !ok {
-		err = fmt.Errorf("invalid pod: %#v", obj)
-		return false, pod, err
+	if !ok {
+		return false, pod, fmt.Errorf("invalid pod: %#v", obj)
 	}
-	newPod := obj.(*api.Pod)
+
 	// Apply default values and validate the pod.
 	if err = defaultFn(newPod); err != nil {
 		return true, pod, err
 	}
 	if errs := validation.ValidatePod(newPod); len(errs) > 0 {
-		err = fmt.Errorf("invalid pod: %v", errs)
-		return true, pod, err
+		return true, pod, fmt.Errorf("invalid pod: %v", errs)
 	}
 	v1Pod := &v1.Pod{}
-	if err := v1.Convert_api_Pod_To_v1_Pod(newPod, v1Pod, nil); err != nil {
+	if err := k8s_api_v1.Convert_core_Pod_To_v1_Pod(newPod, v1Pod, nil); err != nil {
+		klog.Errorf("Pod %q failed to convert to v1", newPod.Name)
 		return true, nil, err
 	}
 	return true, v1Pod, nil
 }
 
 func tryDecodePodList(data []byte, defaultFn defaultFunc) (parsed bool, pods v1.PodList, err error) {
-	obj, err := runtime.Decode(api.Codecs.UniversalDecoder(), data)
+	obj, err := runtime.Decode(legacyscheme.Codecs.UniversalDecoder(), data)
 	if err != nil {
 		return false, pods, err
 	}
+
+	newPods, ok := obj.(*api.PodList)
 	// Check whether the object could be converted to list of pods.
-	if _, ok := obj.(*api.PodList); !ok {
+	if !ok {
 		err = fmt.Errorf("invalid pods list: %#v", obj)
 		return false, pods, err
 	}
-	newPods := obj.(*api.PodList)
+
 	// Apply default values and validate pods.
 	for i := range newPods.Items {
 		newPod := &newPods.Items[i]
@@ -153,7 +163,7 @@ func tryDecodePodList(data []byte, defaultFn defaultFunc) (parsed bool, pods v1.
 		}
 	}
 	v1Pods := &v1.PodList{}
-	if err := v1.Convert_api_PodList_To_v1_PodList(newPods, v1Pods, nil); err != nil {
+	if err := k8s_api_v1.Convert_core_PodList_To_v1_PodList(newPods, v1Pods, nil); err != nil {
 		return true, pods, err
 	}
 	return true, *v1Pods, err

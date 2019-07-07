@@ -1,6 +1,12 @@
+# See the OWNERS docs at https://go.k8s.io/owners
+
 approvers:
-- crassirostris
+- coffeepac
+- monotek
 - piosz
 reviewers:
-- crassirostris
+- coffeepac
+- monotek
 - piosz
+labels:
+- sig/instrumentation

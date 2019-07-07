@@ -1,7 +1,5 @@
 package(default_visibility = ["//visibility:public"])
 
-licenses(["notice"])
-
 load(
     "@io_bazel_rules_go//go:def.bzl",
     "go_library",
@@ -10,9 +8,23 @@ load(
 go_library(
     name = "go_default_library",
     srcs = ["uuid.go"],
-    tags = ["automanaged"],
+    importmap = "k8s.io/kubernetes/vendor/k8s.io/apimachinery/pkg/util/uuid",
+    importpath = "k8s.io/apimachinery/pkg/util/uuid",
     deps = [
-        "//vendor/github.com/pborman/uuid:go_default_library",
-        "//vendor/k8s.io/apimachinery/pkg/types:go_default_library",
+        "//staging/src/k8s.io/apimachinery/pkg/types:go_default_library",
+        "//vendor/github.com/google/uuid:go_default_library",
     ],
+)
+
+filegroup(
+    name = "package-srcs",
+    srcs = glob(["**"]),
+    tags = ["automanaged"],
+    visibility = ["//visibility:private"],
+)
+
+filegroup(
+    name = "all-srcs",
+    srcs = [":package-srcs"],
+    tags = ["automanaged"],
 )
